@@ -60,8 +60,11 @@ md 맨 위에 YAML front matter가 있으면 그 값을 우선합니다.
   `대`/`만대`/`백만대`/`units`/`mn units`, `배`/`x`. 기간 표기(`2026E`, `3Q26`, `FY26`, `1H26`, `상반기`, `YoY`, `QoQ`)가
   같은 문장에 있으면 함께 기록. 각 후보: `원문 조각(앞뒤 40자)`, `값`, `단위`, `기간`, `소속 문장 id`.
 - **변화 표현**: `A에서 B로`, `from X to Y`, `X → Y` 형태는 `이전값`·`새값`을 함께 기록.
-- **표 속 수치**: 첫 열 = 지표, 첫 행 = 기간으로 보고 `지표 | 기간 | 값` 후보를 만듭니다.
-  기간처럼 보이는 열(연도, 분기, E/F 표기)이 있는 표만 사용합니다.
+- **표**: 1차 변환은 표 구조를 추출하지 않습니다(`05-docling-speed.md` 3장). 그래서 1차 주장 추출에서는
+  **문장 속 수치만** 후보로 씁니다. md에 `[표 p.N]` 표시가 있으면 `tables_pending`(표가 있는 페이지 목록)에 기록합니다.
+- **표 속 수치 (2차, 분석 대상 문서만)**: 문서 옆에 `<문서>.tables.md`가 생기면, 첫 열 = 지표, 첫 행 = 기간으로 보고
+  `지표 | 기간 | 값` 후보를 추가합니다. 기간처럼 보이는 열(연도, 분기, E/F 표기)이 있는 표만 씁니다.
+  이런 문서는 `--force`로 주장 추출을 다시 돌리면 표 수치까지 반영됩니다.
 - 우선순위: 요약 구간 → 변화 표현 → 나머지. 상한을 넘으면 뒤에서 자릅니다.
 
 ### B3. 문장 후보 `S1, S2, …` (상위 15개, 섹션당 최대 4개)
@@ -130,7 +133,7 @@ AI 호출이 실패하거나 검증 후 주장이 0개면, 점수 상위 문장 
 
 ## 5. 단계 D — 출력
 
-- `claims/<문서 id>.json`: `{meta, summary, candidates: {sentences, numbers}, claims, origin, llm: {seconds, prompt_tokens, completion_tokens, status}}`
+- `claims/<문서 id>.json`: `{meta, summary, candidates: {sentences, numbers}, tables_pending, claims, origin, llm: {seconds, prompt_tokens, completion_tokens, status}}`
 - `claims.jsonl` (주장 1개 = 1줄): `{week, doc_id, broker, date, title, label, claim, target, direction, horizon, evidence: [{id, text, section, page}], numbers: [{id, text}], origin}`
 - `CLAIMS.md`:
   - 머리말: 주차, 문서 수, 주장 수, 대체(fallback) 비율, 생성 시각
