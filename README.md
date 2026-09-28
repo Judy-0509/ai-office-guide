@@ -11,6 +11,7 @@
 - [`02-token-measure.md`](02-token-measure.md) — 생성 시간이 어디서 쓰이는지 토큰/시간 지표로 측정하는 방법
 - [`03-claims-spec.md`](03-claims-spec.md) — 정리된 리포트 md에서 주간 주장 목록("주장 300줄")을 만드는 구현 명세 (사내 에이전트용)
 - [`04-export-rules.md`](04-export-rules.md) — 결과를 사외로 가져갈 때 지켜야 하는 반출 규칙
+- [`05-docling-speed.md`](05-docling-speed.md) — docling PDF→md 변환 속도 개선 설정과 측정 절차 (사내 에이전트용)
 
 ## 권장 순서
 
