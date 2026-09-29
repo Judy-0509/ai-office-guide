@@ -292,3 +292,27 @@ def test_missing_version_column_in_query_result_raises(tmp_path):
     source = load_source(source_yaml)
     with pytest.raises(ValueError, match="version_column"):
         snapshot.read_source_rows(source)
+
+
+# --- two-digit-year quarter periods ("25Q3") -- the first real in-house table's spelling -------
+
+
+def test_quarterly_two_digit_year_periods_normalize_and_rollup_by_year(tmp_path):
+    fake_source.build_quarterly(tmp_path / "fake_source_quarterly.sqlite")
+    source_yaml = tmp_path / "source.yaml"
+    source_yaml.write_text("db: fake_source_quarterly.sqlite\nview: v_dataplat_quarterly\n",
+                            encoding="utf-8")
+    source = load_source(source_yaml)
+    db_path = tmp_path / "dataplat.sqlite"
+    results = snapshot.run(source, db_path)
+    assert results[0]["status"] == "ok"
+
+    conn = store.connect(db_path)
+    rows = store.query_observations(conn, dataset="model_forecast")
+    periods = {r["period"] for r in rows}
+    assert periods == {"2025Q1", "2025Q2", "2025Q3", "2025Q4"}  # "25Q1" etc -> canonical form
+
+    yearly = store.query_observations(conn, dataset="model_forecast", rollup="year", agg="sum")
+    by_entity = {r["entity"]: r["value"] for r in yearly}
+    assert by_entity["모델A"] == 100.0 + 110.0 + 120.0 + 130.0
+    assert by_entity["모델B"] == 200.0 + 210.0 + 220.0 + 230.0

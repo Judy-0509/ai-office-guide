@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import db
-from .normalize import normalize_period
+from .normalize import coarsen_period, normalize_period, period_range_end_sort
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 DIM_FIELDS = ("metric", "entity", "region", "period", "source")
@@ -103,6 +103,20 @@ def compute_version_sort(conn: sqlite3.Connection, dataset: str, version_label: 
     return existing["version_sort"] if existing else "F" + started_at
 
 
+def _next_lower_version_load_id(conn: sqlite3.Connection, dataset: str,
+                                 version_sort: str) -> int | None:
+    """The latest ok load of the next-LOWER version_sort (strictly less than `version_sort`) --
+    always a DIFFERENT, older label, never a re-issue of the same one. Shared by
+    `previous_load_id_for_version` (diff baseline during ingestion) and `version_diff`'s
+    default `from_label` (always "the distinct label right before `to_label`")."""
+    lower = db.fetchone(
+        conn, "SELECT id FROM loads WHERE dataset=? AND version_sort<? AND status='ok' "
+              "ORDER BY version_sort DESC, id DESC LIMIT 1",
+        (dataset, version_sort),
+    )
+    return int(lower["id"]) if lower else None
+
+
 def previous_load_id_for_version(conn: sqlite3.Connection, dataset: str,
                                   version_sort: str) -> int | None:
     """The diff baseline for a new load: the latest existing ok load of the SAME version_sort
@@ -118,12 +132,18 @@ def previous_load_id_for_version(conn: sqlite3.Connection, dataset: str,
     )
     if same is not None:
         return int(same["id"])
-    lower = db.fetchone(
-        conn, "SELECT id FROM loads WHERE dataset=? AND version_sort<? AND status='ok' "
-              "ORDER BY version_sort DESC, id DESC LIMIT 1",
-        (dataset, version_sort),
+    return _next_lower_version_load_id(conn, dataset, version_sort)
+
+
+def resolve_label_load_id(conn: sqlite3.Connection, dataset: str, version_label: str) -> int | None:
+    """The latest ok load for an EXACT version_label -- used to resolve `version_diff`'s
+    explicit `from_label`/`to_label` arguments."""
+    row = db.fetchone(
+        conn, "SELECT id FROM loads WHERE dataset=? AND version_label=? AND status='ok' "
+              "ORDER BY id DESC LIMIT 1",
+        (dataset, version_label),
     )
-    return int(lower["id"]) if lower else None
+    return int(row["id"]) if row else None
 
 
 def list_version_labels(conn: sqlite3.Connection, dataset: str) -> list[str]:
@@ -263,6 +283,35 @@ def catalog(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
+def catalog_version(conn: sqlite3.Connection) -> str:
+    """Cache key for `chat_spec_cache`: changes whenever any dataset's latest load changes (a
+    new snapshot, a new version label superseding the old "latest"...) -- a hash of every
+    dataset's current latest load id, so a stale cached spec is never reused across a refresh."""
+    rows = db.fetchall(conn, "SELECT dataset, load_id FROM latest_loads ORDER BY dataset")
+    blob = json.dumps([[r["dataset"], r["load_id"]] for r in rows], ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def get_cached_spec(conn: sqlite3.Connection, message_key: str, catalog_version_value: str) -> dict | None:
+    row = db.fetchone(
+        conn, "SELECT spec_json FROM chat_spec_cache WHERE message_key=? AND catalog_version=?",
+        (message_key, catalog_version_value),
+    )
+    return json.loads(row["spec_json"]) if row else None
+
+
+def set_cached_spec(conn: sqlite3.Connection, message_key: str, catalog_version_value: str,
+                     spec: dict) -> None:
+    with db.WRITE_LOCK:
+        conn.execute(
+            "INSERT INTO chat_spec_cache (message_key, catalog_version, spec_json, created_at) "
+            "VALUES (?, ?, ?, ?) ON CONFLICT(message_key, catalog_version) DO UPDATE SET "
+            "spec_json=excluded.spec_json, created_at=excluded.created_at",
+            (message_key, catalog_version_value, json.dumps(spec, ensure_ascii=False), now_iso()),
+        )
+        conn.commit()
+
+
 def _resolve_version_load_id(conn: sqlite3.Connection, dataset: str, version: str) -> int:
     """`version` here is neither "latest" nor "all" -- either a load id (existing behavior) or
     a version_label (its latest ok load)."""
@@ -283,10 +332,39 @@ def _resolve_version_load_id(conn: sqlite3.Connection, dataset: str, version: st
     return load_id
 
 
+def _rollup_rows(rows: list[dict], rollup: str, agg: str) -> list[dict]:
+    """Groups `rows` to the coarser `rollup` level (year|quarter), summing/averaging `value`
+    within each (metric, entity, region, rolled-up period, source) group. A row whose period
+    can't be coarsened further (already at or coarser than `rollup`, or unparseable) keeps its
+    own period unchanged -- rolling up never drops data, worst case it just doesn't merge."""
+    if agg not in ("sum", "avg"):
+        raise ValueError(f"agg는 sum 또는 avg여야 합니다: {agg!r}")
+    groups: dict[tuple, dict] = {}
+    for r in rows:
+        coarsened = coarsen_period(r["period"], rollup)
+        period, period_sort = coarsened if coarsened else (r["period"], r["period_sort"])
+        key = (r["metric"], r["entity"], r["region"], period, r["source"])
+        g = groups.setdefault(key, {
+            "metric": r["metric"], "entity": r["entity"], "region": r["region"],
+            "period": period, "period_sort": period_sort, "source": r["source"],
+            "unit": r["unit"], "_values": [],
+        })
+        if r["value"] is not None:
+            g["_values"].append(r["value"])
+    out = []
+    for g in groups.values():
+        values = g.pop("_values")
+        g["value"] = (sum(values) if agg == "sum" else sum(values) / len(values)) if values else None
+        out.append(g)
+    out.sort(key=lambda r: (r["period_sort"], r["metric"], r["entity"], r["region"], r["source"]))
+    return out
+
+
 def query_observations(conn: sqlite3.Connection, *, dataset: str, metrics: list[str] | None = None,
                         entities: list[str] | None = None, regions: list[str] | None = None,
                         sources: list[str] | None = None, period_from: str | None = None,
-                        period_to: str | None = None, version: str = "latest") -> list[dict]:
+                        period_to: str | None = None, version: str = "latest",
+                        rollup: str | None = None, agg: str = "sum") -> list[dict]:
     if version == "latest":
         table = "latest_observations"
     elif version == "all":
@@ -309,20 +387,23 @@ def query_observations(conn: sqlite3.Connection, *, dataset: str, metrics: list[
     _in_clause("entity", entities)
     _in_clause("region", regions)
     _in_clause("source", sources)
-    # period_from/period_to arrive as human period text ("2024Q1"), same as `period` itself --
-    # normalize to period_sort for the comparison (a no-op if already period_sort-shaped, since
-    # normalize_period only rewrites its own recognized formats).
+    # period_from/period_to arrive as human period text ("2024Q1"), same as `period` itself.
+    # The LOWER bound is already correct as a period's own period_sort (a coarser period's own
+    # sort sits at or before every finer period within it). The UPPER bound needs widening --
+    # see period_range_end_sort's docstring for why (a coarser bound must cover its full range,
+    # e.g. period_to="2025" must include 2025Q4/2025-12/2025W53, not just "2025"'s own sort).
     if period_from:
         clauses.append("period_sort >= ?")
         params.append(normalize_period(period_from).period_sort)
     if period_to:
         clauses.append("period_sort <= ?")
-        params.append(normalize_period(period_to).period_sort)
+        params.append(period_range_end_sort(period_to))
 
     sql = (f"SELECT metric, entity, region, period, period_sort, source, value, unit "
            f"FROM {table} WHERE " + " AND ".join(clauses) +
            " ORDER BY period_sort, metric, entity, region, source")
-    return [dict(r) for r in db.fetchall(conn, sql, params)]
+    rows = [dict(r) for r in db.fetchall(conn, sql, params)]
+    return _rollup_rows(rows, rollup, agg) if rollup else rows
 
 
 def history(conn: sqlite3.Connection, *, dataset: str, metric: str, entity: str,
@@ -356,6 +437,102 @@ def history(conn: sqlite3.Connection, *, dataset: str, metric: str, entity: str,
     else:
         sql = f"SELECT {select} FROM observations o JOIN loads l ON o.load_id=l.id WHERE {where} ORDER BY l.id"
     return [dict(r) for r in db.fetchall(conn, sql, params)]
+
+
+VERSION_DIFF_SORTS = ("abs", "rel")
+
+
+def version_diff(conn: sqlite3.Connection, dataset: str, *, from_label: str | None = None,
+                  to_label: str | None = None, metric: str | None = None, entity: str | None = None,
+                  region: str | None = None, source: str | None = None,
+                  period_from: str | None = None, period_to: str | None = None,
+                  group_by: list[str] | None = None, top: int = 20,
+                  sort: str = "abs") -> dict[str, Any]:
+    """Compares two versions of a dataset, aggregated by `group_by` (sum of old/new per group,
+    then diff/pct computed on those sums -- so e.g. "모델별" ranks correctly across periods
+    instead of drowning in one row per period). `to_label` defaults to the dataset's latest
+    label; `from_label` defaults to the distinct label right before `to_label` (never a
+    re-issue of the same label -- that comparison already happens automatically at ingestion
+    time, see `previous_load_id_for_version`). Raises ValueError for an unknown label, an
+    unknown `group_by` dimension, or no previous version to compare against."""
+    group_by = group_by or ["entity"]
+    unknown_dims = [d for d in group_by if d not in DIM_FIELDS]
+    if unknown_dims:
+        raise ValueError(f"group_by에 알 수 없는 차원이 있습니다: {unknown_dims}")
+    if sort not in VERSION_DIFF_SORTS:
+        raise ValueError(f"sort는 {VERSION_DIFF_SORTS} 중 하나여야 합니다: {sort!r}")
+
+    if to_label is not None:
+        to_load_id = resolve_label_load_id(conn, dataset, to_label)
+        if to_load_id is None:
+            raise ValueError(f"해당 dataset의 버전을 찾을 수 없습니다: {to_label!r}")
+    else:
+        to_load_id = latest_ok_load_id(conn, dataset)
+        if to_load_id is None:
+            raise ValueError(f"데이터가 없는 데이터셋입니다: {dataset!r}")
+        to_label = db.fetchone(conn, "SELECT version_label FROM loads WHERE id=?", (to_load_id,))["version_label"]
+
+    if from_label is not None:
+        from_load_id = resolve_label_load_id(conn, dataset, from_label)
+        if from_load_id is None:
+            raise ValueError(f"해당 dataset의 버전을 찾을 수 없습니다: {from_label!r}")
+    else:
+        to_sort = db.fetchone(conn, "SELECT version_sort FROM loads WHERE id=?", (to_load_id,))["version_sort"]
+        from_load_id = _next_lower_version_load_id(conn, dataset, to_sort)
+        if from_load_id is not None:
+            from_label = db.fetchone(conn, "SELECT version_label FROM loads WHERE id=?",
+                                      (from_load_id,))["version_label"]
+    if from_load_id is None:
+        raise ValueError(f"'{to_label}' 버전 이전에 비교할 버전이 없습니다")
+
+    def fetch(load_id: int) -> list[dict]:
+        return query_observations(
+            conn, dataset=dataset, metrics=[metric] if metric else None,
+            entities=[entity] if entity else None, regions=[region] if region else None,
+            sources=[source] if source else None, period_from=period_from, period_to=period_to,
+            version=str(load_id),
+        )
+
+    def aggregate(rows: list[dict]) -> dict[tuple, float]:
+        out: dict[tuple, float] = {}
+        for r in rows:
+            key = tuple(r[d] for d in group_by)
+            out[key] = out.get(key, 0.0) + (r["value"] or 0.0)
+        return out
+
+    from_agg = aggregate(fetch(from_load_id))
+    to_agg = aggregate(fetch(to_load_id))
+    all_keys = set(from_agg) | set(to_agg)
+
+    rows = []
+    for key in all_keys:
+        old, new = from_agg.get(key), to_agg.get(key)
+        old_v, new_v = old or 0.0, new or 0.0
+        diff = new_v - old_v
+        # a percentage NUMBER (25.0 for +25%), not a fraction -- matches how a raw "12.5%"
+        # source cell is stored elsewhere in dataplat (value=12.5, unit="%"), and lets the
+        # chatbot's number-check match a "25%" sentence against the table as-is.
+        pct = (diff / abs(old_v) * 100) if old is not None and old_v != 0 else None
+        row = dict(zip(group_by, key))
+        row.update({"old": old, "new": new, "diff": diff, "pct": pct,
+                     "_rel_sort": _relative_change(old_v, new_v)})
+        rows.append(row)
+
+    rows.sort(key=(lambda r: r["_rel_sort"]) if sort == "rel" else (lambda r: abs(r["diff"])),
+              reverse=True)
+    for r in rows:
+        del r["_rel_sort"]
+
+    changed = sum(1 for k in all_keys if k in from_agg and k in to_agg and from_agg[k] != to_agg[k])
+    added = sum(1 for k in all_keys if k not in from_agg and k in to_agg)
+    removed = sum(1 for k in all_keys if k in from_agg and k not in to_agg)
+
+    return {
+        "dataset": dataset, "from_label": from_label, "to_label": to_label,
+        "group_by": group_by, "sort": sort,
+        "totals": {"changed": changed, "added": added, "removed": removed, "total_keys": len(all_keys)},
+        "rows": rows[:top],
+    }
 
 
 def list_loads(conn: sqlite3.Connection, dataset: str | None = None) -> list[dict]:

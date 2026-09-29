@@ -15,11 +15,12 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from sqlite3 import Connection
-from typing import Any
+from typing import Any, Callable
 
 from ..llm.client import LLMClient, LLMError
 from ..numbers import normalize_number
 from . import store
+from .normalize import normalize_period
 
 MAX_METRICS = 40
 MAX_ENTITIES = 40
@@ -36,11 +37,15 @@ SPEC_SCHEMA: dict[str, Any] = {
         "regions": {"type": "array", "items": {"type": "string"}},
         "sources": {"type": "array", "items": {"type": "string"}},
         "period_from": {}, "period_to": {},
-        "version": {},  # "latest" | "history" | a version_label (e.g. "2026-08") -- polymorphic,
-                        # checked by hand like "clarify" since labels are dataset-specific
+        "version": {},  # "latest" | "history" | "diff" | a version_label (e.g. "2026-08") --
+                        # polymorphic, checked by hand like "clarify" (labels are dataset-specific)
+        "from": {}, "to": {},  # version="diff" only: optional version labels to compare
         "rows": {"type": "array", "items": {"type": "string"}},
         "cols": {"type": "array", "items": {"type": "string"}},
         "chart": {"type": "string", "enum": ["line", "bar", "stacked", "table"]},
+        "rollup": {},  # null | "year" | "quarter" -- group periods to a coarser level before
+                       # pivoting (e.g. "2025년 합계"); only applies outside history/diff
+        "agg": {},     # "sum" | "avg", only meaningful together with "rollup"
         "clarify": {},  # string | null -- polymorphic, checked by hand like analyst's "topic"
     },
 }
@@ -50,18 +55,36 @@ SPEC_SYSTEM_PROMPT = """당신은 사내 데이터 대시보드의 질의 도우
 바꾸세요. 절대 숫자나 계산 결과를 직접 만들지 마세요 -- 오직 무엇을 조회할지만 결정합니다.
 질문이 모호해서 데이터셋/지표/대상을 하나로 정할 수 없으면 "clarify"에 한국어로 되물을 질문을
 쓰고 나머지 필드는 최선으로 채우세요. 특정 시점 하나의 값을 묻는 질문이면 rows/cols를 비우고
-"chart":"table"을 쓰세요. 값의 변화 이력을 묻는 질문이면 "version":"history"를 쓰세요.
+"chart":"table"을 쓰세요.
+
+**질문에 특정 대상(모델 등) 이름이 정확히 하나만 나왔고, 그 대상이 이전과 비교해 어떻게
+바뀌었는지 묻는 질문**(예: "모델A는 지난 버전과 비교해 어때?", "모델A 출하량 스냅샷별로 어떻게
+바뀌었어?")이면 "version":"history"를 쓰세요 -- entities에도 그 대상 하나만 넣으세요.
 
 일부 데이터셋은 "버전"(예측 시점, 예: "2026-07", "2026-08")이 여러 개 있습니다(카탈로그의
 "버전" 목록 참고). "7월 버전", "최신 버전" 등 특정 버전을 콕 집어 물으면 "version"에 그
 버전 이름을 그대로 쓰세요(예: "version":"2026-08"). 버전을 언급하지 않았거나 최신을 원하면
 "version":"latest"를 쓰세요(버전이 없는 데이터셋에는 이 필드가 아무 영향도 없습니다).
 
+**대상 이름을 콕 집지 않았거나 여러 개(또는 전체)에 걸쳐 두 버전을 비교/순위를 묻는 질문**
+(예: "지난 버전 대비 가장 많이 바뀐/증가한/감소한 모델은?", "버전별로 뭐가 달라졌어?")이면
+"version":"diff"를 쓰세요 -- "history"는 대상 하나의 시간 흐름만 보여주므로 이런 순위/비교
+질문에는 맞지 않습니다. 비교할 두 버전을 특정하지 않았으면 "from"/"to"를 비워두세요(자동으로
+최신 버전과 그 이전 버전을 비교합니다). 무엇을 기준으로 비교할지는 "rows"에 담으세요(예:
+모델별 비교면 ["entity"], 기본값도 ["entity"]). diff 결과 표는 대상별 old(이전 값)/new(새
+값)/diff(차이)/pct(변화율 %)를 코드가 직접 계산해 채웁니다.
+
+**"OO년 합계/총/합"처럼 특정 기간을 더한 값을 물으면** "rollup"에 "year"(연도 단위) 또는
+"quarter"(분기 단위)를 쓰고 "agg"는 보통 "sum"(합계, 기본값), 평균을 물으면 "avg"를 쓰세요.
+합계를 묻는 게 아니면 "rollup"은 null로 두세요.
+
 JSON 스키마:
 {"dataset": "카탈로그의 데이터셋 이름", "metrics": ["..."], "entities": ["..."], "regions": ["..."],
  "sources": ["..."], "period_from": "YYYY..|null", "period_to": "YYYY..|null",
- "version": "latest|history|<버전 이름>", "rows": ["entity"등 표의 행 축],
- "cols": ["period"등 표의 열 축], "chart": "line|bar|stacked|table", "clarify": "되물을 질문|null"}
+ "version": "latest|history|diff|<버전 이름>", "from": "diff용 이전 버전|null",
+ "to": "diff용 새 버전|null", "rows": ["entity"등 표의 행 축(또는 diff의 비교 기준)],
+ "cols": ["period"등 표의 열 축], "chart": "line|bar|stacked|table",
+ "rollup": "year|quarter|null", "agg": "sum|avg", "clarify": "되물을 질문|null"}
 """
 
 EXPLAIN_SCHEMA: dict[str, Any] = {
@@ -107,6 +130,153 @@ def _similarity(a: str, b: str) -> float:
 def _top_candidates(name: str, pool: list[str], k: int) -> list[str]:
     scored = sorted(((c, _similarity(name, c)) for c in pool), key=lambda p: p[1], reverse=True)
     return [c for c, _ in scored[:k]]
+
+
+# --- step 0: rule-based fast path (no LLM) ------------------------------------------------------
+# The shared in-house LLM endpoint queues requests from other company users -- each avoided call
+# saves roughly 1-3 minutes (Round 7). Before ever calling the LLM, try to build a spec
+# deterministically from catalog name matches + a few Korean intent keywords. Only used when a
+# dataset AND an intent were both determined AND at least one entity or period was found;
+# anything less confident falls back to the LLM spec call, same as before.
+
+
+def _norm_for_match(text: str) -> str:
+    return "".join(str(text).split()).casefold()
+
+
+def _find_name_matches(message: str, candidates: list[str]) -> list[str]:
+    """Catalog names that appear as a case/space-insensitive substring of `message`, longest
+    match first (so a more specific name wins over a shorter one it contains). Also matches the
+    part of a candidate before " (" (e.g. "모델A (자사)" matches on "모델A")."""
+    norm_message = _norm_for_match(message)
+    scored: list[tuple[int, str]] = []
+    for c in candidates:
+        variants = [c] + ([c.split(" (", 1)[0]] if " (" in c else [])
+        for v in variants:
+            norm_v = _norm_for_match(v)
+            if norm_v and norm_v in norm_message:
+                scored.append((len(norm_v), c))
+                break
+    scored.sort(key=lambda p: -p[0])
+    seen: set[str] = set()
+    out = []
+    for _, c in scored:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+_YEAR_RANGE_KOREAN_RE = re.compile(r"((?:19|20)\d{2})년?\s*부터\s*((?:19|20)\d{2})년?\s*까지")
+_YEAR_RANGE_TILDE_RE = re.compile(r"((?:19|20)\d{2})\s*[~\-]\s*((?:19|20)\d{2})")
+# Korean-native "<year>년 <n>분기" phrasing (e.g. "2025년 3분기에") -- not a `normalize_period`
+# shape (that module only knows compact codes like "2025Q3"), so it's matched separately, over
+# the raw message, before the generic token scan below.
+_KOREAN_QUARTER_RE = re.compile(r"((?:19|20)\d{2})년?\s*([1-4])\s*분기")
+# Every other period shape (plain years, "2025Q3"/"3Q25"/"FY25"/"2025.09"/... -- anything
+# `normalize_period` recognizes) is found by testing each digit/letter run in the message as a
+# candidate token. Korean characters (particles, "년"/"월"/"분기"...) fall outside this class, so
+# they naturally end a token instead of needing to be stripped -- "25Q3은" still yields "25Q3".
+# (named distinctly from the unrelated `_PERIOD_TOKEN_RE` used later by the number-check code)
+_PERIOD_SCAN_TOKEN_RE = re.compile(r"[0-9A-Za-z][0-9A-Za-z.\-/']*")
+
+
+def _scan_periods(message: str) -> tuple[str | None, str | None]:
+    """(period_from, period_to) scanned out of free Korean text -- years, quarters (compact
+    codes and alt spellings, Korean "<year>년 <n>분기" phrasing), months, and ranges
+    ("2024~2025", "2024년부터 2025년까지"). ponytail: relative periods ("작년", "올해") aren't
+    resolved here -- a message using only those has no period signal and, absent an entity too,
+    falls back to the LLM."""
+    m = _YEAR_RANGE_KOREAN_RE.search(message) or _YEAR_RANGE_TILDE_RE.search(message)
+    if m:
+        return m.group(1), m.group(2)
+    m = _KOREAN_QUARTER_RE.search(message)
+    if m:
+        p = f"{m.group(1)}Q{m.group(2)}"
+        return p, p
+    for token in _PERIOD_SCAN_TOKEN_RE.findall(message):
+        result = normalize_period(token)
+        if result.ok:
+            return result.period, result.period
+    return None, None
+
+
+def _rule_based_spec(message: str, full_catalog: list[dict]) -> dict | None:
+    """A deterministic spec for common question shapes, or None when not confident enough --
+    the caller then falls back to the LLM spec call."""
+    per_dataset_hits: dict[str, dict[str, list[str]]] = {}
+    for ds in full_catalog:
+        hits = {"entities": _find_name_matches(message, ds["entities"]),
+                "regions": _find_name_matches(message, ds["regions"]),
+                "sources": _find_name_matches(message, ds["sources"])}
+        if any(hits.values()):
+            per_dataset_hits[ds["name"]] = hits
+
+    if len(per_dataset_hits) == 1:
+        ds_name = next(iter(per_dataset_hits))
+        ds = next(d for d in full_catalog if d["name"] == ds_name)
+        hits = per_dataset_hits[ds_name]
+    elif len(per_dataset_hits) == 0 and len(full_catalog) == 1:
+        ds = full_catalog[0]
+        hits = {"entities": [], "regions": [], "sources": []}
+    else:
+        return None  # ambiguous across datasets, or no name signal in a multi-dataset catalog
+
+    if len(ds["metrics"]) == 1:
+        metric = ds["metrics"][0]
+    else:
+        metric_hits = _find_name_matches(message, ds["metrics"])
+        if not metric_hits:
+            return None
+        metric = metric_hits[0]
+
+    entities, regions, sources = hits["entities"], hits["regions"], hits["sources"]
+    period_from, period_to = _scan_periods(message)
+    if not entities and not period_from:
+        return None  # no entity and no period -- too little signal, let the LLM handle it
+
+    base = {"dataset": ds["name"], "metrics": [metric], "entities": entities,
+            "regions": regions, "sources": sources,
+            "period_from": period_from, "period_to": period_to, "clarify": None}
+
+    # 추이/흐름/분기별/월별/연도별 mean a TREND across the `period` axis already in the data
+    # (entity x period, oldest to newest) -- NOT a version/snapshot history (`store.history`,
+    # which needs one period pinned down). Version history is only implied by an actual version
+    # word (버전, 지난/이전 버전, 버전 대비, "7월 버전"...), handled by the diff branch below --
+    # the rule path doesn't build a `version:"history"` spec at all; that nuance is left to the
+    # LLM. With no period named, period_from/period_to stay None -- the full available range.
+    if any(kw in message for kw in ("추이", "흐름", "분기별", "월별", "연도별", "연별")) and len(entities) == 1:
+        rollup = ("quarter" if "분기별" in message else
+                  "year" if ("연도별" in message or "연별" in message) else None)
+        return {**base, "version": "latest", "rollup": rollup, "agg": "sum",
+                "rows": ["entity"], "cols": ["period"], "chart": "line"}
+
+    if (any(kw in message for kw in
+            ("지난 버전", "이전 버전", "버전 대비", "바뀐", "변경", "상향", "하향"))
+            or ("가장" in message and "많이" in message
+                and ("증가" in message or "감소" in message))):
+        return {**base, "version": "diff", "from": None, "to": None,
+                "rows": ["entity"], "cols": [], "chart": "bar"}
+
+    if any(kw in message for kw in ("합계", "총", "합")):
+        rollup = "year" if period_from and re.fullmatch(r"(19|20)\d{2}", period_from) else None
+        return {**base, "version": "latest", "rollup": rollup, "agg": "sum",
+                "rows": ["entity"], "cols": ["period"], "chart": "table"}
+
+    if (("비교" in message or "대비" in message or "vs" in message.lower())
+            and len(entities) >= 2):
+        return {**base, "version": "latest", "rows": ["entity"], "cols": ["period"],
+                "chart": "table"}
+
+    if (("얼마" in message or "몇" in message) and len(entities) == 1
+            and period_from and period_from == period_to):
+        return {**base, "version": "latest", "rows": [], "cols": [], "chart": "table"}
+
+    return None  # no recognized intent -- fall back to the LLM
+
+
+def _spec_cache_key(message: str) -> str:
+    return _norm_for_match(message)
 
 
 # --- step 1: candidate narrowing (no LLM) -----------------------------------------------------
@@ -206,6 +376,20 @@ def resolve_entities(values: list[str] | None, candidates: list[str],
     return resolved_e + resolved_i, questions, warnings
 
 
+def _resolve_optional_label(raw: Any, candidates: list[str]) -> tuple[str | None, str | None]:
+    """(resolved label or None, clarification question or None) -- for version="diff"'s
+    optional "from"/"to" spec fields. `raw` absent/blank means "let version_diff pick the
+    default" (None, None); a name that doesn't auto-correct blocks with a clarification, same
+    threshold as every other name in this module."""
+    if raw in (None, ""):
+        return None, None
+    match, score = _resolve_one(str(raw), candidates)
+    if match is None or (match != raw and score < AUTOCORRECT_THRESHOLD):
+        options = ", ".join(candidates) or "(없음)"
+        return None, f"어떤 버전을 말씀하신 건가요? 후보: {options}"
+    return match, None
+
+
 # --- number-checked explanation ----------------------------------------------------------------
 
 
@@ -233,31 +417,104 @@ def _table_number_texts(table: dict) -> set[str]:
     return out
 
 
-def _sentence_numbers_in_table(sentence: str, table: dict) -> bool:
-    # ponytail: a float's decimal form rarely matches what a model chooses to round to --
-    # int() and 2-decimal forms cover the common cases; a mismatch just falls back to the
-    # template sentence (never a wrong-but-confident answer), so erring conservative is fine.
+def _strip_trailing_zero_decimal(text: str) -> str:
+    """"100.0" -> "100", "25.50" -> "25.5" -- a model faithfully echoing a table cell's Python
+    `str()` form ("100.0", since the table itself renders floats that way in the prompt) must
+    compare equal to that same value's canonical no-decimal form (`_num_text(100.0) == "100"`).
+    Confirmed live: every rejected number in 3 real runs (wide/history/diff tables) was this
+    exact mismatch -- "100.0"/"200.0"/"-30.0"/"25.0%" vs table forms "100"/"200"/"-30"/"25"."""
+    if "." not in text:
+        return text
+    stripped = text.rstrip("0").rstrip(".")
+    return stripped or "0"
+
+
+def _first_rejected_number(sentence: str, table: dict) -> str | None:
+    """The first number in `sentence` that appears nowhere in `table` (in either its exact or
+    trailing-.0-stripped form) -- or None if every number checks out. Also used to report
+    (in `warnings`, on fallback) exactly which number triggered the fallback.
+
+    ponytail: a float's 2-decimal rounded form rarely matches what a model chooses to round
+    to beyond that -- a mismatch just falls back to the template sentence (never a
+    wrong-but-confident answer), so erring conservative there is fine."""
     table_numbers = _table_number_texts(table)
     stripped = _PERIOD_TOKEN_RE.sub(" ", sentence)
     for match in _SENTENCE_NUMBER_RE.finditer(stripped):
         norm = normalize_number(match.group())
-        if norm and norm not in table_numbers:
-            return False
-    return True
+        if not norm:
+            continue
+        if norm in table_numbers or _strip_trailing_zero_decimal(norm) in table_numbers:
+            continue
+        return match.group()
+    return None
 
 
-def _template_sentence(table: dict, value_cols: list[int] | None = None) -> str:
-    """`value_cols`: which columns hold actual data values, not id/label columns (e.g. a
-    history table's "load_id" is numeric but not a value -- see the two `explain()` callers)."""
-    rows = table.get("rows") or []
-    cols = value_cols if value_cols is not None else list(range(len(table.get("columns") or [])))
-    values = [row[i] for row in rows for i in cols
-              if i < len(row) and not isinstance(row[i], bool) and isinstance(row[i], (int, float))]
-    if not values:
+def _signed_num_text(value: float) -> str:
+    return f"{'-' if value < 0 else '+'}{_num_text(abs(value))}"
+
+
+# --- type-aware fallback templates --------------------------------------------------------------
+# Used only when the LLM's own sentence fails the number check (or the call itself fails). Each
+# is built for exactly the table shape its `answer()` branch produces, so it can name real
+# row/column labels instead of a generic "first/last/max/min" -- which for a ranking question
+# (diff) is meaningless without knowing WHICH row was first/last.
+
+
+def _template_diff(rows: list[list], group_by: list[str], from_label: str | None,
+                    to_label: str | None, unit: str) -> str:
+    """rows: version_diff's [*group_vals, old, new, diff, pct] rows, already ranked."""
+    if not rows:
+        return "버전 사이에 변화가 없습니다."
+    gb_count = len(group_by)
+
+    def fmt(row: list) -> str:
+        label = " / ".join(str(v) for v in row[:gb_count])
+        diff_v, pct_v = row[gb_count + 2], row[gb_count + 3]
+        diff_text = _signed_num_text(diff_v) + unit
+        pct_text = f"{_signed_num_text(pct_v)}%" if isinstance(pct_v, (int, float)) else "N/A"
+        return f"{label}({diff_text}, {pct_text})"
+
+    sentence = f"가장 많이 바뀐 것은 {fmt(rows[0])}"
+    sentence += f"이고, 다음은 {fmt(rows[1])}입니다." if len(rows) > 1 else "입니다."
+    if from_label and to_label:
+        sentence += f" ({from_label} → {to_label})"
+    return sentence
+
+
+def _template_history(rows: list[list], entity: str, unit: str) -> str:
+    """rows: [load_id, label, value] rows from the history table, oldest to newest."""
+    numeric = [r for r in rows if len(r) > 2 and isinstance(r[2], (int, float))
+               and not isinstance(r[2], bool)]
+    if not numeric:
+        return "이력 데이터가 없습니다."
+    first, last = numeric[0], numeric[-1]
+    prefix = f"{entity}: " if entity else ""
+    sentence = (f"{prefix}{first[1]} {_num_text(first[2])}{unit} → "
+                f"{last[1]} {_num_text(last[2])}{unit}")
+    if len(numeric) > 1:
+        diff = last[2] - first[2]
+        pct_text = f", {_signed_num_text(diff / abs(first[2]) * 100)}%" if first[2] != 0 else ""
+        sentence += f" ({_signed_num_text(diff)}{unit}{pct_text})"
+    return sentence + "."
+
+
+def _template_wide(table: dict, row_dims: list[str], unit: str) -> str:
+    """table: {"columns": row_dims + col_headers, "rows": [...]} from `store.to_wide`."""
+    columns, rows = table.get("columns") or [], table.get("rows") or []
+    row_dims_count = len(row_dims)
+    col_headers = columns[row_dims_count:]
+    cells: list[tuple[float, str, str]] = []
+    for row in rows:
+        row_label = " / ".join(str(v) for v in row[:row_dims_count])
+        for i, col_label in enumerate(col_headers):
+            idx = row_dims_count + i
+            if idx < len(row) and isinstance(row[idx], (int, float)) and not isinstance(row[idx], bool):
+                cells.append((row[idx], row_label, str(col_label)))
+    if not cells:
         return f"조건에 맞는 데이터가 {len(rows)}건 있습니다."
-    first, last, vmax, vmin = values[0], values[-1], max(values), min(values)
-    return (f"첫 값은 {_num_text(first)}, 마지막 값은 {_num_text(last)}이고, "
-            f"최댓값은 {_num_text(vmax)}, 최솟값은 {_num_text(vmin)}입니다.")
+    vmax, vmin = max(cells, key=lambda c: c[0]), min(cells, key=lambda c: c[0])
+    return (f"최댓값: {vmax[1]} {vmax[2]} {_num_text(vmax[0])}{unit}, "
+            f"최솟값: {vmin[1]} {vmin[2]} {_num_text(vmin[0])}{unit}.")
 
 
 def explain_messages(table: dict) -> list[dict]:
@@ -268,18 +525,27 @@ def explain_messages(table: dict) -> list[dict]:
             {"role": "user", "content": "표:\n" + "\n".join(lines)}]
 
 
-def explain(llm: LLMClient, table: dict, value_cols: list[int] | None = None) -> tuple[str, list[str]]:
+def explain(llm: LLMClient, table: dict, template_fn: Callable[[], str],
+            *, timeout: float | None = None) -> tuple[str, list[str]]:
+    """`template_fn`: a zero-arg closure built by the caller (one per table shape -- diff/
+    history/wide -- see `answer()`) that produces the type-aware fallback sentence. Only called
+    when `answer()`'s `explain_mode="llm"` -- the default `explain_mode="template"` skips this
+    LLM call entirely and uses `template_fn()` directly (Round 7: the shared in-house endpoint's
+    queue makes every avoided call worth 1-3 minutes)."""
     if not (table.get("rows")):
         return "조건에 맞는 데이터가 없습니다.", []
     try:
         data = llm.complete_json(explain_messages(table), EXPLAIN_SCHEMA,
-                                  step="dataplat.chat.explain", agent="dataplat")
+                                  step="dataplat.explain", agent="dataplat", timeout=timeout)
         sentence = data.get("sentence", "")
     except LLMError:
-        return _template_sentence(table, value_cols), ["explain_failed_used_template"]
-    if sentence and _sentence_numbers_in_table(sentence, table):
-        return sentence, []
-    return _template_sentence(table, value_cols), ["explain_number_mismatch_used_template"]
+        return template_fn(), ["explain_failed_used_template"]
+    if sentence:
+        rejected = _first_rejected_number(sentence, table)
+        if rejected is None:
+            return sentence, []
+        return template_fn(), [f"explain_number_mismatch_used_template: {rejected!r} not in table"]
+    return template_fn(), ["explain_number_mismatch_used_template"]
 
 
 # --- chart shaping ------------------------------------------------------------------------------
@@ -302,62 +568,168 @@ def _chart_from_history(rows: list[dict], series_name: str, x_labels: list[str])
             "series": [{"name": series_name, "values": [r["value"] for r in rows]}], "unit": ""}
 
 
+def _chart_from_diff(diff_rows: list[dict], group_by: list[str]) -> dict | None:
+    """Bar chart of `diff` by the group dimension(s) -- version_diff's rows are already sorted
+    by the requested rank (abs/rel), so this is a ranked bar chart, not just alphabetical."""
+    if not diff_rows:
+        return None
+    x = [" / ".join(str(r.get(d, "")) for d in group_by) for r in diff_rows]
+    return {"type": "bar", "x": x,
+            "series": [{"name": "diff", "values": [r["diff"] for r in diff_rows]}], "unit": ""}
+
+
 # --- top-level entry point -----------------------------------------------------------------------
 
+DEFAULT_CHAT_TIMEOUT_SEC = 180.0
+_ZERO_TIMINGS = {"spec_seconds": 0.0, "explain_seconds": 0.0, "query_seconds": 0.0}
+_LLM_BUSY_MESSAGE = ("지금 사내 LLM이 붐벼서 응답이 늦습니다. 모델명·기간을 넣어 더 구체적으로 "
+                     "물어보시면 바로 답할 수 있습니다.")
 
-def _clarify(question: str, spec: dict | None, started: float) -> dict:
+
+def _clarify(question: str, spec: dict | None, started: float, *, path: str,
+             timings: dict) -> dict:
     return {"answer": question, "spec": spec, "table": None, "chart": None,
-            "warnings": ["clarify"], "seconds": round(time.perf_counter() - started, 2)}
+            "warnings": ["clarify"], "path": path, "timings": timings,
+            "seconds": round(time.perf_counter() - started, 2)}
 
 
-def answer(ctx: ChatContext, message: str, history: list[dict] | None = None) -> dict:
+def _missing_entities_warning(requested_entities: list[str], rows: list[dict]) -> list[str]:
+    """When specific entities were asked for and some come back with NO rows at all (not just
+    a blank cell), warn instead of silently showing a smaller table."""
+    if not requested_entities:
+        return []
+    present = {r["entity"] for r in rows}
+    return [f"'{e}'은(는) 해당 기간 데이터가 없습니다" for e in requested_entities if e not in present]
+
+
+def answer(ctx: ChatContext, message: str, history: list[dict] | None = None, *,
+           explain_mode: str = "template", chat_timeout: float | None = None) -> dict:
+    """`explain_mode`: "template" (default -- instant, always number-correct, no LLM call) or
+    "llm" (one extra LLM call for a nicer sentence, falling back to the template on failure/
+    mismatch same as before). `chat_timeout`: per-call override for the shared in-house
+    endpoint's queueing delay (default `DEFAULT_CHAT_TIMEOUT_SEC`); on a spec-call timeout,
+    returns a friendly Korean message instead of the generic failure one.
+
+    Spec resolution tries, in order: a deterministic rule-based match (`_rule_based_spec`, no
+    LLM) -> a cached spec for this exact message + current catalog version (`chat_spec_cache`,
+    no LLM) -> the LLM spec call. Response carries which one fired as `path`. Multi-turn
+    messages (`history` non-empty) always go to the LLM -- the rule path and cache are both
+    single-turn only (neither has enough signal to resolve a follow-up like "그럼 작년은?")."""
     started = time.perf_counter()
     history = history or []
+    timeout = DEFAULT_CHAT_TIMEOUT_SEC if chat_timeout is None else chat_timeout
 
-    narrowed = narrow_catalog(ctx.conn, message, history)
     full_catalog = store.catalog(ctx.conn)
     dataset_names = [d["name"] for d in full_catalog]
 
-    try:
-        spec = ctx.llm.complete_json(spec_messages(message, history, narrowed), SPEC_SCHEMA,
-                                      step="dataplat.chat.spec", agent="dataplat")
-    except LLMError as exc:
-        return _clarify(f"질문을 이해하지 못했습니다. 다시 말씀해 주시겠어요? ({exc})", None, started)
+    spec_start = time.perf_counter()
+    path = "rule"
+    spec = None if history else _rule_based_spec(message, full_catalog)
+    cache_key = cat_version = None
+    if spec is None:
+        if not history:
+            cache_key = _spec_cache_key(message)
+            cat_version = store.catalog_version(ctx.conn)
+            spec = store.get_cached_spec(ctx.conn, cache_key, cat_version)
+        if spec is not None:
+            path = "cache"
+        else:
+            path = "llm"
+            narrowed = narrow_catalog(ctx.conn, message, history)
+            try:
+                spec = ctx.llm.complete_json(spec_messages(message, history, narrowed), SPEC_SCHEMA,
+                                              step="dataplat.spec", agent="dataplat", timeout=timeout)
+            except LLMError as exc:
+                timings = {**_ZERO_TIMINGS, "spec_seconds": round(time.perf_counter() - spec_start, 2)}
+                if "timeout" in str(exc).lower():
+                    return _clarify(_LLM_BUSY_MESSAGE, None, started, path=path, timings=timings)
+                return _clarify(f"질문을 이해하지 못했습니다. 다시 말씀해 주시겠어요? ({exc})",
+                                 None, started, path=path, timings=timings)
+            if cache_key is not None:
+                store.set_cached_spec(ctx.conn, cache_key, cat_version, spec)
+    spec_seconds = round(time.perf_counter() - spec_start, 2)
+
+    def _early(question: str) -> dict:
+        return _clarify(question, spec, started, path=path,
+                         timings={**_ZERO_TIMINGS, "spec_seconds": spec_seconds})
 
     if spec.get("clarify"):
-        return _clarify(str(spec["clarify"]), spec, started)
+        return _early(str(spec["clarify"]))
 
     ds_match, ds_score = _resolve_one(spec.get("dataset", ""), dataset_names)
     if ds_match is None or (ds_match != spec.get("dataset") and ds_score < AUTOCORRECT_THRESHOLD):
         options = ", ".join(_top_candidates(spec.get("dataset", ""), dataset_names, MAX_CLARIFY_CANDIDATES))
-        return _clarify(f"어떤 데이터셋을 말씀하신 건가요? 후보: {options or '(없음)'}", spec, started)
+        return _early(f"어떤 데이터셋을 말씀하신 건가요? 후보: {options or '(없음)'}")
 
     ds = next(d for d in full_catalog if d["name"] == ds_match)
+    # only used by the fallback templates -- "" (omitted) when the dataset mixes units, since
+    # tacking one metric's unit onto another's number would be misleading.
+    unit = ds["units"][0] if len(ds["units"]) == 1 else ""
     metrics, metric_q, _ = resolve_names(spec.get("metrics"), ds["metrics"], required=True)
     entities, entity_q, entity_drop = resolve_entities(spec.get("entities"), ds["entities"], message)
     regions, _, region_drop = resolve_names(spec.get("regions"), ds["regions"], required=False)
     sources, _, source_drop = resolve_names(spec.get("sources"), ds["sources"], required=False)
     questions = metric_q + entity_q
     if questions:
-        return _clarify(" / ".join(questions[:3]), spec, started)
+        return _early(" / ".join(questions[:3]))
     drop_warnings = entity_drop + region_drop + source_drop
 
     raw_version = spec.get("version")
-    if raw_version in (None, "", "latest", "history"):
+    if raw_version in (None, "", "latest", "history", "diff"):
         query_version = raw_version or "latest"
     else:
         match, score = _resolve_one(str(raw_version), ds["version_labels"])
         if match is None or (match != raw_version and score < AUTOCORRECT_THRESHOLD):
             options = ", ".join(ds["version_labels"]) or "(없음)"
-            return _clarify(f"어떤 버전을 말씀하신 건가요? 후보: {options}", spec, started)
+            return _early(f"어떤 버전을 말씀하신 건가요? 후보: {options}")
         query_version = match
 
-    if query_version == "history":
+    if query_version == "diff" and not ds["version_labels"]:
+        # a code-level safety net, not just a prompt hint: "diff" is meaningless without
+        # several distinct version labels. A single named entity almost certainly meant
+        # "history" (e.g. "모델A는 지난 스냅샷과 비교해 어때?") -- reinterpret instead of
+        # bouncing a perfectly answerable question into a clarification.
+        if len(entities) == 1:
+            query_version = "history"
+        else:
+            return _early(
+                "이 데이터셋은 버전이 하나뿐이라 여러 대상을 버전별로 비교할 수 없습니다. "
+                "특정 대상을 하나만 알려주시면 그 값의 변화 이력을 보여드릴게요.")
+
+    query_start = time.perf_counter()
+    if query_version == "diff":
+        from_label, from_err = _resolve_optional_label(spec.get("from"), ds["version_labels"])
+        if from_err:
+            return _early(from_err)
+        to_label, to_err = _resolve_optional_label(spec.get("to"), ds["version_labels"])
+        if to_err:
+            return _early(to_err)
+        group_by = [d for d in (spec.get("rows") or ["entity"]) if d] or ["entity"]
+        # a SINGLE named entity narrows the comparison to just it; several (or none) means
+        # "compare across entities" -- the whole point of diff mode -- so don't filter them out.
+        diff_entity = entities[0] if len(entities) == 1 else None
+        try:
+            diff = store.version_diff(
+                ctx.conn, ds_match, from_label=from_label, to_label=to_label,
+                metric=metrics[0] if metrics else None, entity=diff_entity,
+                region=regions[0] if regions else None, source=sources[0] if sources else None,
+                period_from=spec.get("period_from") or None, period_to=spec.get("period_to") or None,
+                group_by=group_by,
+            )
+        except ValueError as exc:
+            return _early(f"버전을 비교할 수 없습니다: {exc}")
+        table = {"columns": group_by + ["old", "new", "diff", "pct"],
+                 "rows": [[r.get(d) for d in group_by] + [r["old"], r["new"], r["diff"], r["pct"]]
+                          for r in diff["rows"]]}
+        chart = _chart_from_diff(diff["rows"], group_by)
+        template_fn = lambda: _template_diff(table["rows"], group_by, diff["from_label"],  # noqa: E731
+                                              diff["to_label"], unit)
+    elif query_version == "history":
         if not metrics or not entities:
-            return _clarify("이력을 보려면 지표와 대상을 하나씩 알려주세요.", spec, started)
+            return _early("이력을 보려면 지표와 대상을 하나씩 알려주세요.")
         period = spec.get("period_to") or spec.get("period_from") or ""
         if not period:
-            return _clarify("이력을 보려면 조회할 기간(period)을 알려주세요.", spec, started)
+            return _early("이력을 보려면 조회할 기간(period)을 알려주세요.")
         # history() only tracks ONE series (no cross-entity ranking/diff query exists yet) --
         # if the model asked for several entities, say so instead of silently answering for
         # just the first one (e.g. "which model changed the most" can't be answered this way).
@@ -370,23 +742,36 @@ def answer(ctx: ChatContext, message: str, history: list[dict] | None = None) ->
         table = {"columns": ["load_id", "label", "value"],
                  "rows": [[r["load_id"], lbl, r["value"]] for r, lbl in zip(rows, labels)]}
         chart = _chart_from_history(rows, f"{metrics[0]}/{entities[0]}", labels)
-        value_cols = [2]  # only "value" -- "load_id" is an id, not a data value
+        template_fn = lambda: _template_history(table["rows"], entities[0], unit)  # noqa: E731
     else:
+        raw_rollup = spec.get("rollup")
+        rollup = raw_rollup if raw_rollup in ("year", "quarter") else None
+        agg = spec.get("agg") if spec.get("agg") in ("sum", "avg") else "sum"
         long_rows = store.query_observations(
             ctx.conn, dataset=ds_match, metrics=metrics or None, entities=entities or None,
             regions=regions or None, sources=sources or None,
             period_from=spec.get("period_from") or None, period_to=spec.get("period_to") or None,
-            version=query_version,
+            version=query_version, rollup=rollup, agg=agg,
         )
         if len(long_rows) > store.QUERY_ROW_CAP:
-            return _clarify("조건에 맞는 데이터가 너무 많습니다. 질문을 더 구체적으로 해주세요.", spec, started)
+            return _early("조건에 맞는 데이터가 너무 많습니다. 질문을 더 구체적으로 해주세요.")
+        drop_warnings += _missing_entities_warning(entities, long_rows)
         row_dims = [d for d in (spec.get("rows") or ["entity"]) if d]
         col_dims = [d for d in (spec.get("cols") or ["period"]) if d]
         table = store.to_wide(long_rows, row_dims, col_dims)
         chart = _chart_from_wide(table, spec.get("chart") or "table", len(row_dims))
-        value_cols = list(range(len(row_dims), len(table["columns"])))  # id/dim columns excluded
+        template_fn = lambda: _template_wide(table, row_dims, unit)  # noqa: E731
+    query_seconds = round(time.perf_counter() - query_start, 2)
 
-    sentence, explain_warnings = explain(ctx.llm, table, value_cols)
+    explain_start = time.perf_counter()
+    if explain_mode == "llm":
+        sentence, explain_warnings = explain(ctx.llm, table, template_fn, timeout=timeout)
+    else:
+        sentence, explain_warnings = template_fn(), []
+    explain_seconds = round(time.perf_counter() - explain_start, 2)
+
     return {"answer": sentence, "spec": spec, "table": table, "chart": chart,
-            "warnings": drop_warnings + explain_warnings,
+            "warnings": drop_warnings + explain_warnings, "path": path,
+            "timings": {"spec_seconds": spec_seconds, "explain_seconds": explain_seconds,
+                        "query_seconds": query_seconds},
             "seconds": round(time.perf_counter() - started, 2)}

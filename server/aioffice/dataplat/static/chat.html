@@ -178,6 +178,12 @@
     input.disabled = v;
   }
 
+  // Most questions resolve in well under a second (rule-based match or a cached spec -- no LLM
+  // call at all). Only a real LLM spec call can be slow, since the shared in-house endpoint
+  // queues requests from other users -- once we've been waiting a couple of seconds, it's very
+  // likely that's what's happening, so upgrade the placeholder to say so.
+  var LLM_HINT_DELAY_MS = 2000;
+
   function send(text) {
     text = (text || input.value).trim();
     if (!text || busy) return;
@@ -186,6 +192,17 @@
     input.value = "";
     setBusy(true);
 
+    var waiting = addMessage("bot", "답변 생성 중...");
+    var startedAt = Date.now();
+    var showedHint = false;
+    var ticker = setInterval(function () {
+      var elapsed = ((Date.now() - startedAt) / 1000).toFixed(0);
+      if (!showedHint && Date.now() - startedAt >= LLM_HINT_DELAY_MS) showedHint = true;
+      waiting.textContent = showedHint
+        ? "사내 LLM 응답 대기 중... " + elapsed + "초 (다른 사용자 요청과 순서를 기다리는 중일 수 있습니다)"
+        : "답변 생성 중...";
+    }, 1000);
+
     fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -193,6 +210,8 @@
     })
       .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
       .then(function (r) {
+        clearInterval(ticker);
+        waiting.remove();
         if (!r.ok) {
           addMessage("error", r.body.error || "오류가 발생했습니다");
           return;
@@ -204,11 +223,18 @@
         if (data.warnings && data.warnings.indexOf("clarify") !== -1) {
           renderSuggestions(bot, data.answer || "");
         }
-        var meta = el("div", "seconds", (data.seconds != null ? data.seconds + "초" : ""));
-        bot.appendChild(meta);
+        // path: "rule"/"cache" never called the LLM (always fast); "llm" made one spec call
+        // (and, only if explicitly requested, a second explain call).
+        var metaText = (data.seconds != null ? data.seconds + "초" : "") +
+          (data.path ? " · " + data.path : "");
+        bot.appendChild(el("div", "seconds", metaText));
         history.push({ role: "assistant", content: data.answer || "" });
       })
-      .catch(function (err) { addMessage("error", "요청 실패: " + err); })
+      .catch(function (err) {
+        clearInterval(ticker);
+        waiting.remove();
+        addMessage("error", "요청 실패: " + err);
+      })
       .then(function () { setBusy(false); input.focus(); });
   }
 

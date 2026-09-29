@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS load_reports (
   report TEXT NOT NULL
 );
 
+-- Chat spec cache: normalized message + catalog_version -> the spec dataplat.chat resolved for
+-- it (from any path: rule/llm), so a repeated question skips the LLM call entirely while the
+-- catalog hasn't changed. See dataplat/store.py's catalog_version()/get_cached_spec().
+CREATE TABLE IF NOT EXISTS chat_spec_cache (
+  message_key TEXT NOT NULL,
+  catalog_version TEXT NOT NULL,
+  spec_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (message_key, catalog_version)
+);
+
 -- Latest = the newest ok load of the HIGHEST version_label (lexical max of version_sort).
 -- Without a version_column every load's version_sort is '' (all equal), so this reduces to
 -- "the newest ok load per dataset" -- today's exact behavior.

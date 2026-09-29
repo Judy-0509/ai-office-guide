@@ -253,17 +253,19 @@ class LLMClient:
         task_id: int | None = None,
         model: str | None = None,
         max_tokens: int | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         """Like `complete()`, but for backends where named `tool_choice` is unverified: the
         model answers with plain JSON in `content` instead of a tool call. Same retry count,
-        schema validation and `llm_calls` logging as `complete()`."""
+        schema validation and `llm_calls` logging as `complete()`. `timeout` overrides
+        `settings.llm_timeout_sec` for this call only (e.g. dataplat.chat's `--chat-timeout`)."""
         use_model = model if model is not None else self.backend.model_for()
         errors: list[str] = []
 
         for _ in range(MAX_ATTEMPTS):
             started = time.perf_counter()
             try:
-                content, usage = self._run_content(messages, use_model, max_tokens)
+                content, usage = self._run_content(messages, use_model, max_tokens, timeout)
                 data = schemas.extract_json_object(content)
                 if data is None:
                     raise schemas.SchemaError("no JSON object found in model output")
@@ -295,9 +297,9 @@ class LLMClient:
 
         raise LLMError(f"step={step} failed: {'; '.join(errors)}")
 
-    def _run_content(self, messages, model, max_tokens=None) -> tuple[str, dict]:
+    def _run_content(self, messages, model, max_tokens=None, timeout=None) -> tuple[str, dict]:
         with self._semaphore:
-            return self.backend.run_content(messages, model, max_tokens=max_tokens)
+            return self.backend.run_content(messages, model, max_tokens=max_tokens, timeout=timeout)
 
     # --- streaming entry point (slides studio) -------------------------------
     def stream_complete(

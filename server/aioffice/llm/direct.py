@@ -65,6 +65,11 @@ class DirectBackend:
                 response = client.post(
                     path, json=payload, headers=headers, timeout=request_timeout
                 )
+            except httpx.TimeoutException as exc:
+                # a distinct message prefix (not just "transport error") lets a caller like
+                # dataplat.chat detect "the shared endpoint was too slow" and show a friendlier
+                # message than a generic failure, without depending on httpx's own wording.
+                raise BackendError(f"direct timeout: {exc}") from exc
             except httpx.HTTPError as exc:
                 raise BackendError(f"direct transport error: {exc}") from exc
             if response.status_code in RETRYABLE_STATUS:

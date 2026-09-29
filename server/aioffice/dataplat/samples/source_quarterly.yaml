@@ -1,0 +1,6 @@
+# Example source.yaml for a table that writes periods as two-digit-year quarters ("25Q3"),
+# matching samples/fake_source.py's build_quarterly() -- the first real in-house table used this
+# exact spelling. normalize_period() recognizes it (and "'25Q3"/"3Q25"/"Q3 2025"/"FY25"/etc --
+# see 03-dataplat-manual.md) with no source.yaml changes needed.
+db: fake_source_quarterly.sqlite
+view: v_dataplat_quarterly

@@ -127,3 +127,42 @@ def build_versioned(path: Path, state: str = "v1") -> Path:
     finally:
         conn.close()
     return path
+
+
+# --- two-digit-year quarter periods ("25Q3"), matching the first real in-house table -----------
+
+_MODEL_FORECAST_25 = [
+    # metric, entity, period ("YYQn"), value
+    ("출하량", "모델A", "25Q1", 100.0), ("출하량", "모델A", "25Q2", 110.0),
+    ("출하량", "모델A", "25Q3", 120.0), ("출하량", "모델A", "25Q4", 130.0),
+    ("출하량", "모델B", "25Q1", 200.0), ("출하량", "모델B", "25Q2", 210.0),
+    ("출하량", "모델B", "25Q3", 220.0), ("출하량", "모델B", "25Q4", 230.0),
+]
+
+_QUARTERLY_VIEW_SQL = """
+CREATE VIEW v_dataplat_quarterly AS
+SELECT 'model_forecast' AS dataset, metric, entity, '' AS region, period, '' AS source, value,
+       '대' AS unit
+FROM tbl_model_forecast
+"""
+
+
+def build_quarterly(path: Path) -> Path:
+    """A single-vintage `model_forecast` dataset with periods spelled the way the first real
+    in-house table wrote them -- two-digit-year quarters like "25Q1".."25Q4" (see
+    `normalize.normalize_period`'s alt-spelling support). Used for the "2025년 모델별 합계"
+    (year rollup) live-check."""
+    path = Path(path)
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            "CREATE TABLE tbl_model_forecast (metric TEXT, entity TEXT, period TEXT, value REAL);"
+        )
+        conn.executemany("INSERT INTO tbl_model_forecast VALUES (?,?,?,?)", _MODEL_FORECAST_25)
+        conn.executescript(_QUARTERLY_VIEW_SQL)
+        conn.commit()
+    finally:
+        conn.close()
+    return path

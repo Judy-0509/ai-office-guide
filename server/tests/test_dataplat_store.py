@@ -145,6 +145,85 @@ def test_query_observations_unknown_version_raises(conn):
         store.query_observations(conn, dataset="shipments", version="not-a-number")
 
 
+# --- rollup/agg -----------------------------------------------------------------------------
+
+
+def test_query_observations_rollup_year_sums_quarters(conn):
+    store.upsert_dataset(conn, "forecast", "예측", store.now_iso())
+    rows = [_obs("출하량", "A", "2024Q1", 10.0), _obs("출하량", "A", "2024Q2", 20.0),
+            _obs("출하량", "A", "2024Q3", 30.0), _obs("출하량", "A", "2024Q4", 40.0)]
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(), finished_at=store.now_iso())
+    result = store.query_observations(conn, dataset="forecast", rollup="year", agg="sum")
+    assert len(result) == 1
+    assert result[0]["period"] == "2024" and result[0]["value"] == 100.0
+
+
+def test_query_observations_rollup_quarter_avg(conn):
+    store.upsert_dataset(conn, "forecast", "예측", store.now_iso())
+    rows = [_obs("출하량", "A", "2024-01", 10.0), _obs("출하량", "A", "2024-02", 20.0),
+            _obs("출하량", "A", "2024-03", 30.0)]
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(), finished_at=store.now_iso())
+    result = store.query_observations(conn, dataset="forecast", rollup="quarter", agg="avg")
+    assert len(result) == 1
+    assert result[0]["period"] == "2024Q1" and result[0]["value"] == pytest.approx(20.0)
+
+
+def test_query_observations_rollup_keeps_separate_entities_and_metrics(conn):
+    store.upsert_dataset(conn, "forecast", "예측", store.now_iso())
+    rows = [_obs("출하량", "A", "2024Q1", 10.0), _obs("출하량", "B", "2024Q1", 5.0),
+            _obs("가격", "A", "2024Q1", 1.0)]
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(), finished_at=store.now_iso())
+    result = store.query_observations(conn, dataset="forecast", rollup="year", agg="sum")
+    assert len(result) == 3  # (출하량,A) (출하량,B) (가격,A) each stay separate groups
+
+
+def test_query_observations_without_rollup_unchanged(conn):
+    # no rollup= -> exactly today's behavior (own periods, untouched)
+    store.upsert_dataset(conn, "forecast", "예측", store.now_iso())
+    rows = [_obs("출하량", "A", "2024Q1", 10.0), _obs("출하량", "A", "2024Q2", 20.0)]
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(), finished_at=store.now_iso())
+    result = store.query_observations(conn, dataset="forecast")
+    assert [r["period"] for r in result] == ["2024Q1", "2024Q2"]
+
+
+def test_query_observations_rollup_bad_agg_raises(conn):
+    store.upsert_dataset(conn, "forecast", "예측", store.now_iso())
+    rows = [_obs("출하량", "A", "2024Q1", 10.0)]
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(), finished_at=store.now_iso())
+    with pytest.raises(ValueError):
+        store.query_observations(conn, dataset="forecast", rollup="year", agg="median")
+
+
+# --- catalog_version / chat_spec_cache -------------------------------------------------------
+
+
+def test_catalog_version_changes_when_latest_load_changes(conn):
+    store.upsert_dataset(conn, "shipments", "출하", store.now_iso())
+    v0 = store.catalog_version(conn)
+    rows = [_obs("출하량", "A", "2024Q1", 10.0)]
+    store.write_load(conn, dataset="shipments", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(), finished_at=store.now_iso())
+    v1 = store.catalog_version(conn)
+    assert v0 != v1
+    v2 = store.catalog_version(conn)
+    assert v1 == v2  # stable when nothing changed
+
+
+def test_chat_spec_cache_roundtrip_and_scoped_by_catalog_version(conn):
+    assert store.get_cached_spec(conn, "제품별 가격지수", "v1") is None
+    spec = {"dataset": "prices", "metrics": ["가격지수"]}
+    store.set_cached_spec(conn, "제품별 가격지수", "v1", spec)
+    assert store.get_cached_spec(conn, "제품별 가격지수", "v1") == spec
+    assert store.get_cached_spec(conn, "제품별 가격지수", "v2") is None  # different catalog_version misses
+    store.set_cached_spec(conn, "제품별 가격지수", "v1", {"dataset": "prices", "metrics": ["다른"]})
+    assert store.get_cached_spec(conn, "제품별 가격지수", "v1")["metrics"] == ["다른"]  # overwrite
+
+
 # --- version labels (source.yaml's version_column) ---------------------------------------------
 
 
@@ -265,3 +344,128 @@ def test_latest_loads_view_picks_highest_version_label(conn):
     # a re-issue of the OLDER label must not become "latest" even though its id is newest
     _write_version(conn, "forecast", "2026-07", [_obs("m", "A", "2024Q1", 3.0)])
     assert store.latest_ok_load_id(conn, "forecast") == l08
+
+
+# --- version_diff -------------------------------------------------------------------------------
+
+
+def _seed_forecast(conn):
+    """2026-07: A=100 B=200 C=150. 2026-08: A=100(unchanged) B=250(+25%) C=120(-20%)."""
+    rows07 = [_obs("출하량", "A", "2024Q1", 100.0), _obs("출하량", "B", "2024Q1", 200.0),
+              _obs("출하량", "C", "2024Q1", 150.0)]
+    rows08 = [_obs("출하량", "A", "2024Q1", 100.0), _obs("출하량", "B", "2024Q1", 250.0),
+              _obs("출하량", "C", "2024Q1", 120.0)]
+    _write_version(conn, "forecast", "2026-07", rows07)
+    _write_version(conn, "forecast", "2026-08", rows08)
+
+
+def test_version_diff_defaults_to_latest_vs_previous_label(conn):
+    _seed_forecast(conn)
+    result = store.version_diff(conn, "forecast")
+    assert result["from_label"] == "2026-07" and result["to_label"] == "2026-08"
+    assert result["totals"] == {"changed": 2, "added": 0, "removed": 0, "total_keys": 3}
+
+
+def test_version_diff_sort_abs_ranks_by_absolute_diff(conn):
+    _seed_forecast(conn)
+    result = store.version_diff(conn, "forecast", sort="abs")
+    assert [r["entity"] for r in result["rows"]] == ["B", "C", "A"]  # |50| > |-30| > |0|
+
+
+def test_version_diff_sort_rel_ranks_by_relative_change(conn):
+    _seed_forecast(conn)
+    result = store.version_diff(conn, "forecast", sort="rel")
+    assert [r["entity"] for r in result["rows"]] == ["B", "C", "A"]  # 25% > 20% > 0%
+    assert result["rows"][0]["pct"] == pytest.approx(25.0)
+    assert result["rows"][1]["pct"] == pytest.approx(-20.0)
+
+
+def test_version_diff_top_caps_rows_but_not_totals(conn):
+    _seed_forecast(conn)
+    result = store.version_diff(conn, "forecast", top=1)
+    assert len(result["rows"]) == 1
+    assert result["totals"]["changed"] == 2  # totals count everything, not just the top slice
+
+
+def test_version_diff_zero_baseline_and_added_key_have_null_pct(conn):
+    rows07 = [_obs("m", "A", "2024Q1", 0.0)]
+    rows08 = [_obs("m", "A", "2024Q1", 50.0), _obs("m", "B", "2024Q1", 10.0)]
+    _write_version(conn, "forecast", "2026-07", rows07)
+    _write_version(conn, "forecast", "2026-08", rows08)
+    result = store.version_diff(conn, "forecast")
+    by_entity = {r["entity"]: r for r in result["rows"]}
+    assert by_entity["A"]["old"] == 0.0 and by_entity["A"]["pct"] is None
+    assert by_entity["B"]["old"] is None and by_entity["B"]["pct"] is None
+    assert result["totals"]["added"] == 1
+
+
+def test_version_diff_removed_key(conn):
+    rows07 = [_obs("m", "A", "2024Q1", 1.0), _obs("m", "B", "2024Q1", 2.0)]
+    rows08 = [_obs("m", "A", "2024Q1", 1.0)]  # B dropped in 08
+    _write_version(conn, "forecast", "2026-07", rows07)
+    _write_version(conn, "forecast", "2026-08", rows08)
+    result = store.version_diff(conn, "forecast")
+    assert result["totals"]["removed"] == 1
+    by_entity = {r["entity"]: r for r in result["rows"]}
+    assert by_entity["B"]["new"] is None and by_entity["B"]["old"] == 2.0
+
+
+def test_version_diff_explicit_from_to_labels(conn):
+    _seed_forecast(conn)
+    _write_version(conn, "forecast", "2026-09",
+                    [_obs("출하량", "A", "2024Q1", 999.0), _obs("출하량", "B", "2024Q1", 999.0),
+                     _obs("출하량", "C", "2024Q1", 999.0)])
+    result = store.version_diff(conn, "forecast", from_label="2026-07", to_label="2026-08")
+    assert result["from_label"] == "2026-07" and result["to_label"] == "2026-08"
+    assert {r["entity"] for r in result["rows"]} == {"A", "B", "C"}
+    assert all(r["new"] != 999.0 for r in result["rows"])
+
+
+def test_version_diff_unknown_label_raises(conn):
+    _seed_forecast(conn)
+    with pytest.raises(ValueError, match="버전"):
+        store.version_diff(conn, "forecast", to_label="2099-01")
+
+
+def test_version_diff_unknown_group_by_dim_raises(conn):
+    _seed_forecast(conn)
+    with pytest.raises(ValueError, match="group_by"):
+        store.version_diff(conn, "forecast", group_by=["bogus"])
+
+
+def test_version_diff_bad_sort_raises(conn):
+    _seed_forecast(conn)
+    with pytest.raises(ValueError, match="sort"):
+        store.version_diff(conn, "forecast", sort="banana")
+
+
+def test_version_diff_no_previous_version_raises(conn):
+    _write_version(conn, "forecast", "2026-07", [_obs("m", "A", "2024Q1", 1.0)])
+    with pytest.raises(ValueError):
+        store.version_diff(conn, "forecast")  # only one label ever -- nothing to compare
+
+
+def test_version_diff_aggregates_across_periods_for_group_by(conn):
+    # same entity, two periods -- group_by=["entity"] must sum both periods per version
+    rows07 = [_obs("m", "A", "2024Q1", 10.0), _obs("m", "A", "2024Q2", 20.0)]
+    rows08 = [_obs("m", "A", "2024Q1", 15.0), _obs("m", "A", "2024Q2", 25.0)]
+    _write_version(conn, "forecast", "2026-07", rows07)
+    _write_version(conn, "forecast", "2026-08", rows08)
+    result = store.version_diff(conn, "forecast", group_by=["entity"])
+    assert result["rows"] == [{"entity": "A", "old": 30.0, "new": 40.0, "diff": 10.0,
+                                "pct": pytest.approx(10.0 / 30.0 * 100)}]
+
+
+def test_version_diff_filters_by_metric_entity_region_source(conn):
+    rows07 = [{"metric": "m1", "entity": "A", "region": "KR", "period": "2024Q1",
+               "period_sort": "20240100", "source": "S1", "value": 1.0, "unit": ""},
+              {"metric": "m2", "entity": "A", "region": "US", "period": "2024Q1",
+               "period_sort": "20240100", "source": "S2", "value": 2.0, "unit": ""}]
+    rows08 = [{"metric": "m1", "entity": "A", "region": "KR", "period": "2024Q1",
+               "period_sort": "20240100", "source": "S1", "value": 5.0, "unit": ""},
+              {"metric": "m2", "entity": "A", "region": "US", "period": "2024Q1",
+               "period_sort": "20240100", "source": "S2", "value": 9.0, "unit": ""}]
+    _write_version(conn, "forecast", "2026-07", rows07)
+    _write_version(conn, "forecast", "2026-08", rows08)
+    result = store.version_diff(conn, "forecast", metric="m1", region="KR", source="S1")
+    assert result["rows"] == [{"entity": "A", "old": 1.0, "new": 5.0, "diff": 4.0, "pct": 400.0}]

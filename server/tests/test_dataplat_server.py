@@ -11,10 +11,12 @@ import urllib.request
 import pytest
 
 from aioffice.config import Settings
+from aioffice.dataplat import chat as chat_module
 from aioffice.dataplat import server as dpserver
 from aioffice.dataplat import snapshot, store
 from aioffice.dataplat.samples import fake_source
 from aioffice.dataplat.source import load_source
+from aioffice.llm.client import LLMClient
 
 
 def _build_source(tmp_path, state="v1"):
@@ -58,6 +60,28 @@ def _post(port, path, payload, headers=None):
             return r.status, json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+class _FakeContentBackend:
+    """Same shape as tests/test_dataplat_chat.py's FakeContentBackend -- queued responses for
+    complete_json (spec/explain), no real LLM call."""
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.model = "fake-model"
+        self.name = "direct"
+        self.calls: list[dict] = []
+
+    def model_for(self):
+        return self.model
+
+    def run_content(self, messages, model, timeout=None, max_tokens=None):
+        import json as _json
+
+        self.calls.append({"messages": messages, "model": model})
+        payload = self.responses.pop(0)
+        content = payload if isinstance(payload, str) else _json.dumps(payload, ensure_ascii=False)
+        return content, {"prompt_tokens": 10, "completion_tokens": 20}
 
 
 def test_build_server_refuses_non_loopback_host_without_token(tmp_path):
@@ -114,6 +138,15 @@ def test_query_missing_dataset_is_400(running_server):
     port, *_ = running_server
     status, body, _ = _get(port, "/api/query")
     assert status == 400 and "error" in body
+
+
+def test_query_rollup_and_agg_passthrough(running_server):
+    port, *_ = running_server
+    status, body, _ = _get(
+        port, "/api/query?dataset=shipments&entity=%EB%AA%A8%EB%8D%B8A&rollup=year&agg=sum")
+    assert status == 200
+    periods = {r["period"] for r in body["rows"]}
+    assert all(len(p) == 4 for p in periods)  # every row rolled up to a bare year
 
 
 def test_query_wide_pivots_entity_by_period(running_server):
@@ -257,6 +290,58 @@ def test_chat_page_served(running_server):
     assert "text/html" in headers.get("Content-Type", "")
 
 
+def test_build_server_defaults_explain_mode_and_chat_timeout(tmp_path):
+    source, db_path, settings = _seed(tmp_path)
+    srv = dpserver.build_server(db_path, source, settings, "127.0.0.1", 0)
+    try:
+        assert srv.explain_mode == "template"
+        assert srv.chat_timeout_sec == chat_module.DEFAULT_CHAT_TIMEOUT_SEC
+    finally:
+        srv.server_close()
+
+
+@pytest.fixture()
+def running_chat_server(tmp_path):
+    """Same as running_server, but with a fake LLM backend injected so /api/chat can be
+    exercised over real HTTP without a real in-house endpoint."""
+    source, db_path, settings = _seed(tmp_path)
+    backend = _FakeContentBackend([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "rows": ["entity"],
+         "cols": ["period"], "clarify": None},
+        {"sentence": "이것은 LLM이 만든 설명입니다."},
+    ])
+    conn = store.connect(db_path)
+    llm = LLMClient(settings, conn, backend=backend)
+    srv = dpserver.build_server(db_path, source, settings, "127.0.0.1", 0, llm=llm)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port, backend
+    finally:
+        srv.shutdown()
+        thread.join(5)
+        srv.server_close()
+
+
+def test_chat_endpoint_defaults_to_template_explain_one_llm_call(running_chat_server):
+    port, backend = running_chat_server
+    status, body = _post(port, "/api/chat", {"message": "모델A 출하량 보여줘"})
+    assert status == 200
+    assert body["path"] == "llm"
+    assert len(backend.calls) == 1  # spec only -- explain used the template by default
+    assert "timings" in body and "query_seconds" in body["timings"]
+
+
+def test_chat_endpoint_explain_llm_override_via_request_body(running_chat_server):
+    port, backend = running_chat_server
+    status, body = _post(port, "/api/chat",
+                          {"message": "모델A 출하량 보여줘", "explain": "llm"})
+    assert status == 200
+    assert body["answer"] == "이것은 LLM이 만든 설명입니다."
+    assert len(backend.calls) == 2  # spec + explain both ran
+
+
 # --- version_column (a dataset with several forecast vintages) ----------------------------------
 
 
@@ -322,3 +407,39 @@ def test_loads_show_version_label(running_versioned_server):
     assert status == 200
     labels = {l["version_label"] for l in body["loads"]}
     assert labels == {"2026-07", "2026-08"}
+
+
+def test_version_diff_defaults_and_ranks_by_abs(running_versioned_server):
+    status, body, _ = _get(running_versioned_server, "/api/version_diff?dataset=forecast")
+    assert status == 200
+    assert body["from_label"] == "2026-07" and body["to_label"] == "2026-08"
+    assert [r["entity"] for r in body["rows"]] == ["모델B", "모델C", "모델A"]
+
+
+def test_version_diff_sort_rel_and_top(running_versioned_server):
+    status, body, _ = _get(running_versioned_server,
+                            "/api/version_diff?dataset=forecast&sort=rel&top=1")
+    assert status == 200
+    assert len(body["rows"]) == 1 and body["rows"][0]["entity"] == "모델B"
+    assert body["totals"]["changed"] == 2  # totals unaffected by top
+
+
+def test_version_diff_missing_dataset_is_400(running_versioned_server):
+    status, body, _ = _get(running_versioned_server, "/api/version_diff")
+    assert status == 400
+
+
+def test_version_diff_unknown_label_is_400(running_versioned_server):
+    status, body, _ = _get(running_versioned_server,
+                            "/api/version_diff?dataset=forecast&to=2099-01")
+    assert status == 400
+
+
+def test_version_diff_explicit_labels_and_group_by(running_versioned_server):
+    status, body, _ = _get(
+        running_versioned_server,
+        "/api/version_diff?dataset=forecast&from=2026-07&to=2026-08&group_by=entity",
+    )
+    assert status == 200
+    assert body["group_by"] == ["entity"]
+    assert {r["entity"] for r in body["rows"]} == {"모델A", "모델B", "모델C"}

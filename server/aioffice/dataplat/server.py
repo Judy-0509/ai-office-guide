@@ -1,6 +1,6 @@
 """`python -m aioffice.dataplat.server --db <path> --source <source.yaml> [--site <dashboard
 site/ dir>] [--pre "<their existing aggregation command>"] [--env .env] [--host 127.0.0.1]
-[--port 8000] [--admin-token T] [--cors ORIGIN]`
+[--port 8000] [--admin-token T] [--cors ORIGIN] [--explain llm|template] [--chat-timeout SECONDS]`
 
 Serves the dashboard build from `--site` (SPA fallback to index.html) AND the API on the same
 origin -- no CORS needed in production; `--cors` is only for the Vite dev server. Also serves
@@ -37,6 +37,13 @@ def _parse_list(value: str | None) -> list[str] | None:
         return None
     items = [v.strip() for v in value.split(",") if v.strip()]
     return items or None
+
+
+def _parse_int(value: str | None, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -134,6 +141,8 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_query(conn, q)
         elif path == "/api/history":
             self._handle_history(conn, q)
+        elif path == "/api/version_diff":
+            self._handle_version_diff(conn, q)
         elif path == "/api/loads":
             self._send_json({"loads": store.list_loads(conn, q("dataset"))})
         elif path.startswith("/api/loads/"):
@@ -155,6 +164,7 @@ class Handler(BaseHTTPRequestHandler):
                 entities=_parse_list(q("entity")), regions=_parse_list(q("region")),
                 sources=_parse_list(q("source")), period_from=q("period_from"),
                 period_to=q("period_to"), version=q("version") or "latest",
+                rollup=q("rollup") or None, agg=q("agg") or "sum",
             )
         except ValueError as exc:
             self._send_json({"error": str(exc)}, status=400)
@@ -190,6 +200,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send_json({"history": store.history(conn, dataset=dataset, metric=metric,
                                                     entity=entity, period=period, source=q("source"))})
+
+    def _handle_version_diff(self, conn, q) -> None:
+        dataset = q("dataset")
+        if not dataset:
+            self._send_json({"error": "dataset 파라미터가 필요합니다"}, status=400)
+            return
+        try:
+            result = store.version_diff(
+                conn, dataset, from_label=q("from"), to_label=q("to"), metric=q("metric"),
+                entity=q("entity"), region=q("region"), source=q("source"),
+                period_from=q("period_from"), period_to=q("period_to"),
+                group_by=_parse_list(q("group_by")) or ["entity"],
+                top=_parse_int(q("top"), 20), sort=q("sort") or "abs",
+            )
+        except ValueError as exc:
+            self._send_json({"error": str(exc)}, status=400)
+            return
+        self._send_json(result)
 
     def _handle_load_detail(self, conn, path: str) -> None:
         raw_id = path.rsplit("/", 1)[-1]
@@ -244,13 +272,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "message가 필요합니다"}, status=400)
             return
         history = body.get("history") or []
+        explain_mode = body.get("explain") or self.server.explain_mode  # type: ignore[attr-defined]
 
         acquired = self.server.chat_lock.acquire(blocking=False)  # type: ignore[attr-defined]
         if not acquired:
             self._send_json({"error": "다른 질문을 처리 중입니다. 잠시 후 다시 시도해주세요."}, status=409)
             return
         try:
-            result = chat_module.answer(self.server.chat_ctx, message, history)  # type: ignore[attr-defined]
+            result = chat_module.answer(  # type: ignore[attr-defined]
+                self.server.chat_ctx, message, history, explain_mode=explain_mode,
+                chat_timeout=self.server.chat_timeout_sec,
+            )
             self._send_json(result)
         finally:
             self.server.chat_lock.release()  # type: ignore[attr-defined]
@@ -287,7 +319,9 @@ class Handler(BaseHTTPRequestHandler):
 def build_server(db_path: Path, source: SourceConfig, settings: Settings, host: str, port: int, *,
                   site: Path | None = None, pre_command: str | None = None,
                   admin_token: str | None = None, cors: str | None = None,
-                  llm: Any = None) -> ThreadingHTTPServer:
+                  llm: Any = None, explain_mode: str = "template",
+                  chat_timeout_sec: float = chat_module.DEFAULT_CHAT_TIMEOUT_SEC,
+                  ) -> ThreadingHTTPServer:
     """Raises SystemExit if `host` isn't loopback and no `admin_token` was given."""
     if host not in LOOPBACK_HOSTS and not admin_token:
         raise SystemExit("--host가 127.0.0.1/localhost가 아니면 --admin-token이 반드시 필요합니다")
@@ -312,6 +346,8 @@ def build_server(db_path: Path, source: SourceConfig, settings: Settings, host: 
     server.refresh_state = {"running": False, "last_result": None}  # type: ignore[attr-defined]
     server.chat_lock = threading.Lock()  # type: ignore[attr-defined]
     server.chat_ctx = chat_module.ChatContext(conn=conn, llm=llm_client)  # type: ignore[attr-defined]
+    server.explain_mode = explain_mode  # type: ignore[attr-defined]
+    server.chat_timeout_sec = chat_timeout_sec  # type: ignore[attr-defined]
     return server
 
 
@@ -332,6 +368,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--admin-token", default=None, help="POST /api/refresh에 필요")
     parser.add_argument("--cors", default=None, help="Vite 개발 서버용 허용 Origin")
+    parser.add_argument("--explain", choices=["llm", "template"], default="template",
+                         help="챗봇 설명 문장 기본값 (기본 template -- LLM 호출 없이 즉시 생성)")
+    parser.add_argument("--chat-timeout", type=float, dest="chat_timeout",
+                         default=chat_module.DEFAULT_CHAT_TIMEOUT_SEC,
+                         help="챗봇 LLM 호출 1건당 타임아웃(초) -- 사내 공용 엔드포인트가 붐빌 때 대비 (기본 180)")
     args = parser.parse_args(argv)
 
     settings = Settings.load(Path(args.env) if args.env else None)
@@ -342,6 +383,7 @@ def main(argv: list[str] | None = None) -> None:
             Path(args.db), source, settings, args.host, args.port,
             site=Path(args.site) if args.site else None, pre_command=args.pre_command,
             admin_token=args.admin_token, cors=args.cors,
+            explain_mode=args.explain, chat_timeout_sec=args.chat_timeout,
         )
     except SystemExit as exc:
         print(f"오류: {exc}", flush=True)
