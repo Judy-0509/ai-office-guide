@@ -1,14 +1,18 @@
 """`python -m aioffice.dataplat.server --db <path> --source <source.yaml> [--site <dashboard
 site/ dir>] [--pre "<their existing aggregation command>"] [--env .env] [--host 127.0.0.1]
-[--port 8000] [--admin-token T] [--cors ORIGIN] [--explain llm|template] [--chat-timeout SECONDS]`
+[--port 8000] [--admin-token T] [--cors ORIGIN] [--explain llm|template] [--chat-timeout SECONDS]
+[--aliases aliases.yaml]`
 
 Serves the dashboard build from `--site` (SPA fallback to index.html) AND the API on the same
 origin -- no CORS needed in production; `--cors` is only for the Vite dev server. Also serves
 the reference chatbot page at `/chat`.
 
-GET endpoints (catalog/query/history/loads/refresh-status) are always open (intranet
-dashboard). `POST /api/refresh` requires `--admin-token` (header `Authorization: Bearer` or
-`X-API-Key`) whenever given, and the server refuses to start bound off-loopback without one.
+GET endpoints (catalog/query/history/loads/refresh-status/suggestions/digest/aliases/ask status)
+are always open (intranet dashboard). `POST /api/refresh`, `POST /api/ask`, `DELETE /api/ask/*`,
+and `DELETE /api/aliases/learned/*` require `--admin-token` (header `Authorization: Bearer` or
+`X-API-Key`) whenever one is given, and the server refuses to start bound off-loopback without
+one. A single background `AskWorker` (dataplat.ask) processes `/api/ask` jobs FIFO for the life
+of the server -- see `build_server`.
 """
 from __future__ import annotations
 
@@ -23,6 +27,8 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
+from . import aliases as aliases_module
+from . import ask as ask_module
 from . import chat as chat_module
 from . import snapshot, store
 from .source import SourceConfig, load_source
@@ -125,6 +131,17 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_refresh()
         elif path == "/api/chat":
             self._handle_chat()
+        elif path == "/api/ask":
+            self._handle_ask_post()
+        else:
+            self._send_json({"error": "not found"}, status=404)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        path = urllib.parse.urlsplit(self.path).path
+        if path.startswith("/api/ask/"):
+            self._handle_ask_cancel(path)
+        elif path.startswith("/api/aliases/learned/"):
+            self._handle_alias_delete(path)
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -150,6 +167,16 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/refresh/status":
             with self.server.refresh_lock:  # type: ignore[attr-defined]
                 self._send_json(dict(self.server.refresh_state))  # type: ignore[attr-defined]
+        elif path == "/api/suggestions":
+            self._handle_suggestions(conn, q)
+        elif path == "/api/digest":
+            self._handle_digest(conn, q)
+        elif path == "/api/aliases":
+            self._handle_aliases_get(conn)
+        elif path == "/api/ask":
+            self._handle_ask_recent(conn, q)
+        elif path.startswith("/api/ask/"):
+            self._handle_ask_get(conn, path)
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -264,12 +291,20 @@ class Handler(BaseHTTPRequestHandler):
         self._send_json({"ok": True}, status=202)
 
     def _handle_chat(self) -> None:
+        """`{message, history?}` (normal question -- rule/cache only, never the LLM) OR
+        `{spec_patch, message?}` (a clarify-button/suggestion click -- runs `spec_patch`
+        directly, `path="button"`; `message` here is only the ORIGINAL question behind the
+        button, if any, so the Round 8 learning loop can remember it)."""
         body = self._body_or_400()
         if body is None:
             return
+        spec_patch = body.get("spec_patch")
         message = body.get("message")
-        if not message or not isinstance(message, str):
-            self._send_json({"error": "message가 필요합니다"}, status=400)
+        if spec_patch is None and (not message or not isinstance(message, str)):
+            self._send_json({"error": "message 또는 spec_patch가 필요합니다"}, status=400)
+            return
+        if spec_patch is not None and not isinstance(spec_patch, dict):
+            self._send_json({"error": "spec_patch가 잘못되었습니다"}, status=400)
             return
         history = body.get("history") or []
         explain_mode = body.get("explain") or self.server.explain_mode  # type: ignore[attr-defined]
@@ -279,13 +314,101 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"error": "다른 질문을 처리 중입니다. 잠시 후 다시 시도해주세요."}, status=409)
             return
         try:
-            result = chat_module.answer(  # type: ignore[attr-defined]
-                self.server.chat_ctx, message, history, explain_mode=explain_mode,
-                chat_timeout=self.server.chat_timeout_sec,
-            )
+            if spec_patch is not None:
+                result = chat_module.answer_with_spec(  # type: ignore[attr-defined]
+                    self.server.chat_ctx, spec_patch, original_message=message,
+                    explain_mode=explain_mode, chat_timeout=self.server.chat_timeout_sec,
+                )
+            else:
+                result = chat_module.answer(  # type: ignore[attr-defined]
+                    self.server.chat_ctx, message, history, explain_mode=explain_mode,
+                    chat_timeout=self.server.chat_timeout_sec,
+                )
             self._send_json(result)
         finally:
             self.server.chat_lock.release()  # type: ignore[attr-defined]
+
+    def _handle_suggestions(self, conn, q) -> None:
+        dataset = q("dataset")
+        if not dataset:
+            self._send_json({"error": "dataset 파라미터가 필요합니다"}, status=400)
+            return
+        self._send_json({"suggestions": chat_module.build_suggestions(conn, dataset)})
+
+    def _handle_digest(self, conn, q) -> None:
+        dataset = q("dataset")
+        if not dataset:
+            self._send_json({"error": "dataset 파라미터가 필요합니다"}, status=400)
+            return
+        self._send_json({"digests": store.latest_digests(conn, dataset)})
+
+    def _handle_aliases_get(self, conn) -> None:
+        aliases_cfg = self.server.aliases  # type: ignore[attr-defined]
+        self._send_json({"aliases": aliases_cfg.raw if aliases_cfg else {},
+                          "learned": store.list_learned_aliases(conn)})
+
+    def _handle_alias_delete(self, path: str) -> None:
+        if not self._admin_authorized():
+            self._send_json({"error": "인증이 필요합니다"}, status=401)
+            return
+        raw_id = path.rsplit("/", 1)[-1]
+        try:
+            alias_id = int(raw_id)
+        except ValueError:
+            self._send_json({"error": f"잘못된 id: {raw_id}"}, status=400)
+            return
+        ok = store.delete_learned_alias(self.server.conn, alias_id)  # type: ignore[attr-defined]
+        if not ok:
+            self._send_json({"error": "찾을 수 없습니다"}, status=404)
+            return
+        self._send_json({"ok": True})
+
+    def _handle_ask_post(self) -> None:
+        if not self._admin_authorized():
+            self._send_json({"error": "인증이 필요합니다"}, status=401)
+            return
+        body = self._body_or_400()
+        if body is None:
+            return
+        message = body.get("message")
+        if not message or not isinstance(message, str):
+            self._send_json({"error": "message가 필요합니다"}, status=400)
+            return
+        history = body.get("history") or []
+        job_id = store.create_ask_job(self.server.conn, message=message, history=history)  # type: ignore[attr-defined]
+        self._send_json({"job_id": job_id}, status=202)
+
+    def _handle_ask_get(self, conn, path: str) -> None:
+        raw_id = path.rsplit("/", 1)[-1]
+        try:
+            job_id = int(raw_id)
+        except ValueError:
+            self._send_json({"error": f"잘못된 job id: {raw_id}"}, status=400)
+            return
+        result = ask_module.job_status(conn, job_id)
+        if result is None:
+            self._send_json({"error": "찾을 수 없습니다"}, status=404)
+            return
+        self._send_json(result)
+
+    def _handle_ask_recent(self, conn, q) -> None:
+        self._send_json({"jobs": store.list_ask_jobs(conn, limit=_parse_int(q("recent"), 20))})
+
+    def _handle_ask_cancel(self, path: str) -> None:
+        if not self._admin_authorized():
+            self._send_json({"error": "인증이 필요합니다"}, status=401)
+            return
+        raw_id = path.rsplit("/", 1)[-1]
+        try:
+            job_id = int(raw_id)
+        except ValueError:
+            self._send_json({"error": f"잘못된 job id: {raw_id}"}, status=400)
+            return
+        ok = ask_module.cancel_job(self.server.conn, job_id)  # type: ignore[attr-defined]
+        if not ok:
+            self._send_json({"error": "취소할 수 없습니다 (이미 끝났거나 존재하지 않음)"}, status=404)
+            return
+        self._send_json({"ok": True})
 
     # --- static: dashboard SPA + reference chat page ------------------------------------------
     def _serve_chat_html(self) -> None:
@@ -321,8 +444,14 @@ def build_server(db_path: Path, source: SourceConfig, settings: Settings, host: 
                   admin_token: str | None = None, cors: str | None = None,
                   llm: Any = None, explain_mode: str = "template",
                   chat_timeout_sec: float = chat_module.DEFAULT_CHAT_TIMEOUT_SEC,
+                  aliases_path: Path | None = None, start_ask_worker: bool = True,
                   ) -> ThreadingHTTPServer:
-    """Raises SystemExit if `host` isn't loopback and no `admin_token` was given."""
+    """Raises SystemExit if `host` isn't loopback and no `admin_token` was given.
+
+    Starts a background `AskWorker` (dataplat.ask, `/api/ask`'s FIFO job processor) unless
+    `start_ask_worker=False` (tests that don't exercise `/api/ask` can skip it -- one less
+    thread to manage). Callers that stop the returned server should also call
+    `server.ask_worker.stop()` if it was started (see `main()`)."""
     if host not in LOOPBACK_HOSTS and not admin_token:
         raise SystemExit("--host가 127.0.0.1/localhost가 아니면 --admin-token이 반드시 필요합니다")
 
@@ -331,6 +460,8 @@ def build_server(db_path: Path, source: SourceConfig, settings: Settings, host: 
     db_path = Path(db_path)
     conn = store.connect(db_path)
     llm_client = llm or LLMClient(settings, conn)
+    store.reap_stale_ask_jobs(conn)  # any job "running" at a previous crash is stale now
+    aliases_cfg = aliases_module.load_aliases(aliases_path)
 
     server = ThreadingHTTPServer((host, port), Handler)
     server.daemon_threads = True
@@ -345,9 +476,15 @@ def build_server(db_path: Path, source: SourceConfig, settings: Settings, host: 
     server.refresh_lock = threading.RLock()  # type: ignore[attr-defined]
     server.refresh_state = {"running": False, "last_result": None}  # type: ignore[attr-defined]
     server.chat_lock = threading.Lock()  # type: ignore[attr-defined]
-    server.chat_ctx = chat_module.ChatContext(conn=conn, llm=llm_client)  # type: ignore[attr-defined]
+    server.aliases = aliases_cfg  # type: ignore[attr-defined]
+    server.chat_ctx = chat_module.ChatContext(conn=conn, llm=llm_client, aliases=aliases_cfg)  # type: ignore[attr-defined]
     server.explain_mode = explain_mode  # type: ignore[attr-defined]
     server.chat_timeout_sec = chat_timeout_sec  # type: ignore[attr-defined]
+    server.ask_worker = None  # type: ignore[attr-defined]
+    if start_ask_worker:
+        server.ask_worker = ask_module.AskWorker(  # type: ignore[attr-defined]
+            server.chat_ctx, explain_mode=explain_mode, chat_timeout=chat_timeout_sec)  # type: ignore[attr-defined]
+        server.ask_worker.start()  # type: ignore[attr-defined]
     return server
 
 
@@ -373,10 +510,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--chat-timeout", type=float, dest="chat_timeout",
                          default=chat_module.DEFAULT_CHAT_TIMEOUT_SEC,
                          help="챗봇 LLM 호출 1건당 타임아웃(초) -- 사내 공용 엔드포인트가 붐빌 때 대비 (기본 180)")
+    parser.add_argument("--aliases", default=None,
+                         help="aliases.yaml 경로 (기본: --source 옆의 aliases.yaml이 있으면 자동 사용)")
     args = parser.parse_args(argv)
 
     settings = Settings.load(Path(args.env) if args.env else None)
     source = load_source(Path(args.source))
+    if args.aliases:
+        aliases_path = Path(args.aliases)
+    else:
+        default_aliases = Path(args.source).parent / "aliases.yaml"
+        aliases_path = default_aliases if default_aliases.exists() else None
 
     try:
         server = build_server(
@@ -384,6 +528,7 @@ def main(argv: list[str] | None = None) -> None:
             site=Path(args.site) if args.site else None, pre_command=args.pre_command,
             admin_token=args.admin_token, cors=args.cors,
             explain_mode=args.explain, chat_timeout_sec=args.chat_timeout,
+            aliases_path=aliases_path,
         )
     except SystemExit as exc:
         print(f"오류: {exc}", flush=True)
@@ -395,6 +540,8 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if server.ask_worker is not None:  # type: ignore[attr-defined]
+            server.ask_worker.stop()  # type: ignore[attr-defined]
         server.server_close()
 
 

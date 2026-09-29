@@ -60,6 +60,53 @@ CREATE TABLE IF NOT EXISTS chat_spec_cache (
   PRIMARY KEY (message_key, catalog_version)
 );
 
+-- Batch-generated summaries (dataplat.digest, run after a snapshot -- waiting on the LLM is
+-- harmless there). kind: "version_summary" | "load_summary" | "entity_note". `table_json` is
+-- the code-computed table the text was number-checked against.
+CREATE TABLE IF NOT EXISTS digests (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  dataset TEXT NOT NULL,
+  load_id INTEGER NOT NULL,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  text TEXT NOT NULL,
+  table_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_digests_dataset ON digests(dataset, load_id);
+
+-- Async "AI에게 물어보기" queue (POST /api/ask): a single FIFO worker thread processes these
+-- via chat.answer_via_llm() -- see dataplat/ask.py. Persisted so a server restart never loses a
+-- finished answer; any job still "running" at startup is stale (the process that was running it
+-- is gone) and gets reaped to status="error" -- see store.reap_stale_ask_jobs().
+CREATE TABLE IF NOT EXISTS ask_jobs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  message TEXT NOT NULL,
+  history_json TEXT NOT NULL DEFAULT '[]',
+  status TEXT NOT NULL DEFAULT 'queued',  -- queued | running | done | error | cancelled
+  result_json TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ask_jobs_status ON ask_jobs(status, id);
+
+-- Learned aliases (Round 8 "learning loop"): a phrase the fast path/alias config didn't resolve
+-- on its own, but an /api/ask job (LLM) or a clarify-button pick did -- reused by the fast path
+-- next time the same phrase comes up. `values_json` is a JSON list of resolved catalog values.
+CREATE TABLE IF NOT EXISTS learned_aliases (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  dataset TEXT NOT NULL,
+  dim TEXT NOT NULL,          -- entities | regions | metrics
+  phrase TEXT NOT NULL,
+  values_json TEXT NOT NULL,
+  source_job_id INTEGER,
+  hit_count INTEGER NOT NULL DEFAULT 1,
+  created_at TEXT NOT NULL,
+  UNIQUE (dataset, dim, phrase)
+);
+
 -- Latest = the newest ok load of the HIGHEST version_label (lexical max of version_sort).
 -- Without a version_column every load's version_sort is '' (all equal), so this reduces to
 -- "the newest ok load per dataset" -- today's exact behavior.

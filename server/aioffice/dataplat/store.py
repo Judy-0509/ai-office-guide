@@ -583,3 +583,140 @@ def to_wide(rows: list[dict], row_dims: list[str], col_dims: list[str]) -> dict:
     columns = list(row_dims) + [" / ".join(ck) for ck in col_keys]
     out_rows = [list(rk) + [pivot[rk].get(ck) for ck in col_keys] for rk in row_keys]
     return {"columns": columns, "rows": out_rows}
+
+
+# --- digests (dataplat.digest -- batch-generated summaries) ---------------------------------
+
+
+def insert_digest(conn: sqlite3.Connection, *, dataset: str, load_id: int, kind: str, title: str,
+                   text: str, table: dict, created_at: str) -> int:
+    with db.WRITE_LOCK:
+        digest_id = db.insert(
+            conn, "digests", dataset=dataset, load_id=load_id, kind=kind, title=title, text=text,
+            table_json=json.dumps(table, ensure_ascii=False), created_at=created_at,
+        )
+        conn.commit()
+    return digest_id
+
+
+def has_digest_for_load(conn: sqlite3.Connection, dataset: str, load_id: int) -> bool:
+    row = db.fetchone(conn, "SELECT 1 FROM digests WHERE dataset=? AND load_id=? LIMIT 1",
+                       (dataset, load_id))
+    return row is not None
+
+
+def latest_digests(conn: sqlite3.Connection, dataset: str) -> list[dict]:
+    """Every digest row for `dataset`'s most recently digested load (one summary kind plus up to
+    5 "entity_note" rows) -- [] if `dataplat.digest` has never run for it."""
+    last_load = db.fetchone(
+        conn, "SELECT load_id FROM digests WHERE dataset=? ORDER BY load_id DESC LIMIT 1",
+        (dataset,))
+    if last_load is None:
+        return []
+    rows = db.fetchall(
+        conn, "SELECT * FROM digests WHERE dataset=? AND load_id=? ORDER BY id",
+        (dataset, last_load["load_id"]))
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["table"] = json.loads(d.pop("table_json"))
+        out.append(d)
+    return out
+
+
+# --- async ask jobs (dataplat.ask) ------------------------------------------------------------
+
+
+def create_ask_job(conn: sqlite3.Connection, *, message: str, history: list[dict]) -> int:
+    with db.WRITE_LOCK:
+        job_id = db.insert(
+            conn, "ask_jobs", message=message,
+            history_json=json.dumps(history, ensure_ascii=False), status="queued",
+            created_at=now_iso(),
+        )
+        conn.commit()
+    return job_id
+
+
+def get_ask_job(conn: sqlite3.Connection, job_id: int) -> dict | None:
+    row = db.fetchone(conn, "SELECT * FROM ask_jobs WHERE id=?", (job_id,))
+    return dict(row) if row else None
+
+
+def next_queued_ask_job(conn: sqlite3.Connection) -> dict | None:
+    row = db.fetchone(conn, "SELECT * FROM ask_jobs WHERE status='queued' ORDER BY id LIMIT 1")
+    return dict(row) if row else None
+
+
+def ask_job_queue_position(conn: sqlite3.Connection, job_id: int) -> int:
+    """1-based position among still-queued jobs (older id = earlier in line); 0 if `job_id`
+    isn't currently queued (already running/done/etc)."""
+    row = db.fetchone(
+        conn, "SELECT COUNT(*) AS n FROM ask_jobs WHERE status='queued' AND id<=? "
+              "AND ?=(SELECT status FROM ask_jobs WHERE id=?)",
+        (job_id, "queued", job_id),
+    )
+    return int(row["n"]) if row and row["n"] else 0
+
+
+def update_ask_job(conn: sqlite3.Connection, job_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    with db.WRITE_LOCK:
+        set_clause = ", ".join(f"{k}=?" for k in fields)
+        conn.execute(f"UPDATE ask_jobs SET {set_clause} WHERE id=?", (*fields.values(), job_id))
+        conn.commit()
+
+
+def list_ask_jobs(conn: sqlite3.Connection, limit: int = 20) -> list[dict]:
+    rows = db.fetchall(conn, "SELECT * FROM ask_jobs ORDER BY id DESC LIMIT ?", (limit,))
+    return [dict(r) for r in rows]
+
+
+def reap_stale_ask_jobs(conn: sqlite3.Connection) -> int:
+    """Any job left "running" is stale (the process that was running it is gone) -- called once
+    at server startup. Returns how many were reaped."""
+    with db.WRITE_LOCK:
+        cur = conn.execute(
+            "UPDATE ask_jobs SET status='error', error='중단됨 (서버가 재시작되었습니다)', "
+            "finished_at=? WHERE status='running'", (now_iso(),))
+        conn.commit()
+        return cur.rowcount
+
+
+# --- learned aliases (Round 8 learning loop) ---------------------------------------------------
+
+
+def upsert_learned_alias(conn: sqlite3.Connection, *, dataset: str, dim: str, phrase: str,
+                          values: list[str], source_job_id: int | None = None) -> None:
+    with db.WRITE_LOCK:
+        conn.execute(
+            "INSERT INTO learned_aliases (dataset, dim, phrase, values_json, source_job_id, "
+            "hit_count, created_at) VALUES (?, ?, ?, ?, ?, 1, ?) "
+            "ON CONFLICT(dataset, dim, phrase) DO UPDATE SET "
+            "values_json=excluded.values_json, hit_count=hit_count+1",
+            (dataset, dim, phrase, json.dumps(values, ensure_ascii=False), source_job_id,
+             now_iso()),
+        )
+        conn.commit()
+
+
+def list_learned_aliases(conn: sqlite3.Connection, dataset: str | None = None) -> list[dict]:
+    if dataset:
+        rows = db.fetchall(conn, "SELECT * FROM learned_aliases WHERE dataset=? ORDER BY id",
+                            (dataset,))
+    else:
+        rows = db.fetchall(conn, "SELECT * FROM learned_aliases ORDER BY id")
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["values"] = json.loads(d.pop("values_json"))
+        out.append(d)
+    return out
+
+
+def delete_learned_alias(conn: sqlite3.Connection, alias_id: int) -> bool:
+    with db.WRITE_LOCK:
+        cur = conn.execute("DELETE FROM learned_aliases WHERE id=?", (alias_id,))
+        conn.commit()
+        return cur.rowcount > 0

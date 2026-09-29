@@ -29,6 +29,17 @@
     padding: 4px 12px; font-size: 12px; cursor: pointer;
   }
   .suggestions button:hover { background: #dbeafe; }
+  .suggestions button.askAi { border-color: #fbbf24; background: #fffbeb; color: #92400e; }
+  .suggestions button.askAi:hover { background: #fef3c7; }
+  .digestCard {
+    align-self: flex-start; max-width: 720px; padding: 10px 14px; border-radius: 10px;
+    background: #f0fdf4; border: 1px solid #bbf7d0; font-size: 13px; white-space: pre-wrap;
+  }
+  .digestCard b { display: block; margin-bottom: 4px; }
+  .pendingJobs {
+    font-size: 12px; color: #6b7280; padding: 6px 16px; background: #fffbeb;
+    border-top: 1px solid #fde68a; display: none;
+  }
   #inputRow { flex: none; display: flex; gap: 8px; padding: 12px 16px; background: #fff; border-top: 1px solid #e5e7eb; }
   #inputRow input { flex: 1; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
   #inputRow button { padding: 10px 18px; border: none; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
@@ -38,6 +49,7 @@
 <body>
 <header>데이터 플랫폼 챗봇 -- 표와 차트로 답합니다 (참고용 단일 페이지, 팀 React 앱에 이식하거나 임베드하세요)</header>
 <div id="log"></div>
+<div id="pendingJobs" class="pendingJobs"></div>
 <div id="inputRow">
   <input id="input" type="text" placeholder="예: 모델A 출하량 분기별로 보여줘" autocomplete="off">
   <button id="send">보내기</button>
@@ -151,17 +163,19 @@
     container.appendChild(svg);
   }
 
-  // "다시 묻기": clarification answers list candidates after "다음 중 하나인가요?"/"후보:" --
-  // turn those into one-click quick replies instead of asking the user to retype.
-  function parseSuggestions(text) {
+  // "다시 묻기": a VALIDATION-failure clarify (unknown dataset/entity) still comes back as plain
+  // text listing candidates after "다음 중 하나인가요?"/"후보:" -- turn those into quick-reply
+  // buttons too, same as the Round 8 `options` array below (which covers the "nothing at all
+  // recognized" case with clickable spec_patch/ask_ai choices instead).
+  function parseTextSuggestions(text) {
     var m = /(?:다음 중 하나인가요\?|후보:)\s*(.+)$/.exec(text);
     if (!m) return [];
     return m[1].split(",").map(function (s) { return s.trim(); })
       .filter(function (s) { return s && s !== "(없음)" && s !== "(후보 없음)"; });
   }
 
-  function renderSuggestions(container, text) {
-    var options = parseSuggestions(text);
+  function renderTextSuggestions(container, text) {
+    var options = parseTextSuggestions(text);
     if (!options.length) return;
     var box = el("div", "suggestions");
     options.forEach(function (opt) {
@@ -172,17 +186,46 @@
     container.appendChild(box);
   }
 
+  // Round 8 `options`: each either has `spec_patch` (runs instantly, no LLM) or
+  // `action:"ask_ai"` (always last -- queues an async job).
+  function renderOptionButtons(container, options, originalMessage) {
+    if (!options || !options.length) return;
+    var box = el("div", "suggestions");
+    options.forEach(function (opt) {
+      var b = el("button", null, opt.label);
+      if (opt.action === "ask_ai") {
+        b.className = "askAi";
+        b.addEventListener("click", function () { askAI(originalMessage); });
+      } else {
+        b.addEventListener("click", function () { runSpecPatch(opt.spec_patch, originalMessage); });
+      }
+      box.appendChild(b);
+    });
+    container.appendChild(box);
+  }
+
+  function renderChatResult(data, originalMessage) {
+    var bot = addMessage("bot", data.answer || "");
+    renderTable(bot, data.table);
+    renderChart(bot, data.chart);
+    if (data.options && data.options.length) {
+      renderOptionButtons(bot, data.options, originalMessage);
+    } else if (data.warnings && data.warnings.indexOf("clarify") !== -1) {
+      renderTextSuggestions(bot, data.answer || "");
+    }
+    // path: "rule"/"cache"/"button" never call the LLM (always fast); "llm" only happens inside
+    // an async /api/ask job (see askAI()), never from a plain send()/runSpecPatch() call.
+    var metaText = (data.seconds != null ? data.seconds + "초" : "") +
+      (data.path ? " · " + data.path : "");
+    bot.appendChild(el("div", "seconds", metaText));
+    return bot;
+  }
+
   function setBusy(v) {
     busy = v;
     sendBtn.disabled = v;
     input.disabled = v;
   }
-
-  // Most questions resolve in well under a second (rule-based match or a cached spec -- no LLM
-  // call at all). Only a real LLM spec call can be slow, since the shared in-house endpoint
-  // queues requests from other users -- once we've been waiting a couple of seconds, it's very
-  // likely that's what's happening, so upgrade the placeholder to say so.
-  var LLM_HINT_DELAY_MS = 2000;
 
   function send(text) {
     text = (text || input.value).trim();
@@ -192,17 +235,6 @@
     input.value = "";
     setBusy(true);
 
-    var waiting = addMessage("bot", "답변 생성 중...");
-    var startedAt = Date.now();
-    var showedHint = false;
-    var ticker = setInterval(function () {
-      var elapsed = ((Date.now() - startedAt) / 1000).toFixed(0);
-      if (!showedHint && Date.now() - startedAt >= LLM_HINT_DELAY_MS) showedHint = true;
-      waiting.textContent = showedHint
-        ? "사내 LLM 응답 대기 중... " + elapsed + "초 (다른 사용자 요청과 순서를 기다리는 중일 수 있습니다)"
-        : "답변 생성 중...";
-    }, 1000);
-
     fetch("/api/chat", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -210,37 +242,131 @@
     })
       .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
       .then(function (r) {
-        clearInterval(ticker);
-        waiting.remove();
         if (!r.ok) {
           addMessage("error", r.body.error || "오류가 발생했습니다");
           return;
         }
-        var data = r.body;
-        var bot = addMessage("bot", data.answer || "");
-        renderTable(bot, data.table);
-        renderChart(bot, data.chart);
-        if (data.warnings && data.warnings.indexOf("clarify") !== -1) {
-          renderSuggestions(bot, data.answer || "");
-        }
-        // path: "rule"/"cache" never called the LLM (always fast); "llm" made one spec call
-        // (and, only if explicitly requested, a second explain call).
-        var metaText = (data.seconds != null ? data.seconds + "초" : "") +
-          (data.path ? " · " + data.path : "");
-        bot.appendChild(el("div", "seconds", metaText));
-        history.push({ role: "assistant", content: data.answer || "" });
+        renderChatResult(r.body, text);
+        history.push({ role: "assistant", content: r.body.answer || "" });
       })
-      .catch(function (err) {
-        clearInterval(ticker);
-        waiting.remove();
-        addMessage("error", "요청 실패: " + err);
-      })
+      .catch(function (err) { addMessage("error", "요청 실패: " + err); })
       .then(function () { setBusy(false); input.focus(); });
+  }
+
+  // A clarify-button/suggestion click: runs its spec_patch directly (no LLM, no rule-path
+  // re-matching) -- instant, same as a normal send().
+  function runSpecPatch(specPatch, originalMessage) {
+    if (!specPatch) return;
+    setBusy(true);
+    fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ spec_patch: specPatch, message: originalMessage }),
+    })
+      .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
+      .then(function (r) {
+        if (!r.ok) { addMessage("error", r.body.error || "오류가 발생했습니다"); return; }
+        renderChatResult(r.body, originalMessage);
+      })
+      .catch(function (err) { addMessage("error", "요청 실패: " + err); })
+      .then(function () { setBusy(false); });
+  }
+
+  // --- async "AI에게 물어보기" (/api/ask): the only way this page ever reaches the LLM -------
+
+  var pendingJobs = {}; // job_id -> { message, botMsg }
+  var pendingJobsEl = document.getElementById("pendingJobs");
+  var pollTimer = null;
+  var POLL_INTERVAL_MS = 5000;
+
+  function updatePendingJobsBar() {
+    var ids = Object.keys(pendingJobs);
+    if (!ids.length) { pendingJobsEl.style.display = "none"; return; }
+    pendingJobsEl.style.display = "block";
+    pendingJobsEl.textContent = "AI 응답 대기 중인 질문 " + ids.length + "건 -- "
+      + ids.map(function (id) { return pendingJobs[id].message; }).join(", ");
+  }
+
+  function pollPendingJobs() {
+    var ids = Object.keys(pendingJobs);
+    if (!ids.length) { clearInterval(pollTimer); pollTimer = null; return; }
+    ids.forEach(function (id) {
+      fetch("/api/ask/" + id)
+        .then(function (res) { return res.json(); })
+        .then(function (job) {
+          if (job.status === "queued" || job.status === "running") return;
+          var entry = pendingJobs[id];
+          delete pendingJobs[id];
+          updatePendingJobsBar();
+          if (job.status === "done" && job.result) {
+            addMessage("bot", "✅ 완료: \"" + entry.message + "\"");
+            renderChatResult(job.result, entry.message);
+          } else if (job.status === "cancelled") {
+            addMessage("error", "취소됨: \"" + entry.message + "\"");
+          } else {
+            addMessage("error", "실패: \"" + entry.message + "\" (" + (job.error || "") + ")");
+          }
+        })
+        .catch(function () {}); // a transient poll failure just retries next tick
+    });
+  }
+
+  function askAI(message) {
+    if (!message) return;
+    fetch("/api/ask", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: message, history: history.slice(-8) }),
+    })
+      .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
+      .then(function (r) {
+        if (!r.ok) { addMessage("error", r.body.error || "오류가 발생했습니다"); return; }
+        addMessage("bot", "AI에게 물어봤습니다: \"" + message + "\" -- 사내 LLM이 붐빌 수 있어 몇 분 걸릴 수 있습니다. 완료되면 알려드릴게요.");
+        pendingJobs[r.body.job_id] = { message: message };
+        updatePendingJobsBar();
+        if (!pollTimer) pollTimer = setInterval(pollPendingJobs, POLL_INTERVAL_MS);
+      })
+      .catch(function (err) { addMessage("error", "요청 실패: " + err); });
+  }
+
+  // --- suggestion chips + digest card on open (first dataset in the catalog) ----------------
+
+  function renderStartupCards() {
+    fetch("/api/catalog").then(function (res) { return res.json(); }).then(function (cat) {
+      var ds = cat.datasets && cat.datasets[0];
+      if (!ds) return;
+      fetch("/api/digest?dataset=" + encodeURIComponent(ds.name))
+        .then(function (res) { return res.json(); })
+        .then(function (d) {
+          var summary = (d.digests || []).find(function (x) { return x.kind !== "entity_note"; });
+          if (!summary) return;
+          var card = el("div", "digestCard");
+          card.appendChild(el("b", null, summary.title));
+          card.appendChild(document.createTextNode(summary.text));
+          log.appendChild(card);
+        })
+        .catch(function () {});
+      fetch("/api/suggestions?dataset=" + encodeURIComponent(ds.name))
+        .then(function (res) { return res.json(); })
+        .then(function (s) {
+          if (!s.suggestions || !s.suggestions.length) return;
+          var bot = addMessage("bot", "이런 질문은 바로 답할 수 있어요:");
+          var box = el("div", "suggestions");
+          s.suggestions.forEach(function (opt) {
+            var b = el("button", null, opt.label);
+            b.addEventListener("click", function () { runSpecPatch(opt.spec_patch, opt.label); });
+            box.appendChild(b);
+          });
+          bot.appendChild(box);
+        })
+        .catch(function () {});
+    }).catch(function () {});
   }
 
   sendBtn.addEventListener("click", function () { send(); });
   input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
   addMessage("bot", "안녕하세요. 데이터에 대해 물어보세요 (예: \"모델A 출하량 분기별로 보여줘\", \"2024Q1 대비 바뀐 값 있어?\").");
+  renderStartupCards();
 })();
 </script>
 </body>

@@ -62,6 +62,16 @@ def _post(port, path, payload, headers=None):
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _delete(port, path, headers=None):
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", method="DELETE",
+                                  headers=headers or {})
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
 class _FakeContentBackend:
     """Same shape as tests/test_dataplat_chat.py's FakeContentBackend -- queued responses for
     complete_json (spec/explain), no real LLM call."""
@@ -93,6 +103,7 @@ def test_build_server_refuses_non_loopback_host_without_token(tmp_path):
 def test_build_server_allows_non_loopback_with_a_token(tmp_path):
     source, db_path, settings = _seed(tmp_path)
     srv = dpserver.build_server(db_path, source, settings, "0.0.0.0", 0, admin_token="sekrit")
+    srv.ask_worker.stop()
     srv.server_close()
 
 
@@ -112,6 +123,8 @@ def running_server(tmp_path):
     try:
         yield port, tmp_path, srv
     finally:
+        if srv.ask_worker is not None:
+            srv.ask_worker.stop()
         srv.shutdown()
         thread.join(5)
         srv.server_close()
@@ -290,6 +303,86 @@ def test_chat_page_served(running_server):
     assert "text/html" in headers.get("Content-Type", "")
 
 
+# --- Round 8: suggestions, digest, aliases, ask cancel over HTTP --------------------------------
+
+
+def test_suggestions_endpoint_returns_precomputed_options(running_server):
+    port, *_ = running_server
+    status, body, _ = _get(port, "/api/suggestions?dataset=shipments")
+    assert status == 200
+    assert body["suggestions"]
+    assert all("spec_patch" in s for s in body["suggestions"])
+
+
+def test_suggestions_endpoint_missing_dataset_is_400(running_server):
+    port, *_ = running_server
+    status, body, _ = _get(port, "/api/suggestions")
+    assert status == 400
+
+
+def test_digest_endpoint_empty_before_digest_has_run(running_server):
+    port, *_ = running_server
+    status, body, _ = _get(port, "/api/digest?dataset=shipments")
+    assert status == 200
+    assert body["digests"] == []
+
+
+def test_aliases_endpoint_returns_config_and_learned(running_server):
+    port, tmp_path, srv = running_server
+    store.upsert_learned_alias(srv.conn, dataset="shipments", dim="entities",
+                                phrase="테스트별칭", values=["모델A"])
+    status, body, _ = _get(port, "/api/aliases")
+    assert status == 200
+    assert body["aliases"] == {}  # no aliases.yaml configured for this fixture
+    assert len(body["learned"]) == 1
+    assert body["learned"][0]["phrase"] == "테스트별칭"
+
+
+def test_delete_learned_alias_requires_admin_token_off_loopback(running_server):
+    port, tmp_path, srv = running_server  # admin_token="sekrit-token" per this fixture
+    before = store.list_learned_aliases(srv.conn)
+    store.upsert_learned_alias(srv.conn, dataset="shipments", dim="entities",
+                                phrase="삭제될별칭", values=["모델A"])
+    [row] = [r for r in store.list_learned_aliases(srv.conn) if r["phrase"] == "삭제될별칭"]
+
+    status, _body = _delete(port, f"/api/aliases/learned/{row['id']}")
+    assert status == 401
+
+    status2, body2 = _delete(port, f"/api/aliases/learned/{row['id']}",
+                              headers={"Authorization": "Bearer sekrit-token"})
+    assert status2 == 200 and body2["ok"] is True
+    assert store.list_learned_aliases(srv.conn) == before  # back to the pre-insert state
+
+
+def test_ask_post_returns_202_then_cancel_before_pickup(running_chat_server):
+    port, backend = running_chat_server
+    status, body = _post(port, "/api/ask", {"message": "모델A 얼마야"})
+    assert status == 202
+    job_id = body["job_id"]
+
+    status2, body2 = _delete(port, f"/api/ask/{job_id}")
+    assert status2 == 200 and body2["ok"] is True
+
+    status3, body3, _ = _get(port, f"/api/ask/{job_id}")
+    assert status3 == 200
+    assert body3["status"] == "cancelled"
+
+
+def test_ask_recent_lists_jobs(running_chat_server):
+    port, _backend = running_chat_server
+    _post(port, "/api/ask", {"message": "질문1"})
+    _post(port, "/api/ask", {"message": "질문2"})
+    status, body, _ = _get(port, "/api/ask?recent=10")
+    assert status == 200
+    assert len(body["jobs"]) == 2
+
+
+def test_cancel_unknown_ask_job_is_404(running_chat_server):
+    port, _backend = running_chat_server
+    status, body = _delete(port, "/api/ask/999999")
+    assert status == 404
+
+
 def test_build_server_defaults_explain_mode_and_chat_timeout(tmp_path):
     source, db_path, settings = _seed(tmp_path)
     srv = dpserver.build_server(db_path, source, settings, "127.0.0.1", 0)
@@ -297,6 +390,7 @@ def test_build_server_defaults_explain_mode_and_chat_timeout(tmp_path):
         assert srv.explain_mode == "template"
         assert srv.chat_timeout_sec == chat_module.DEFAULT_CHAT_TIMEOUT_SEC
     finally:
+        srv.ask_worker.stop()
         srv.server_close()
 
 
@@ -319,27 +413,85 @@ def running_chat_server(tmp_path):
     try:
         yield port, backend
     finally:
+        if srv.ask_worker is not None:
+            srv.ask_worker.stop()
         srv.shutdown()
         thread.join(5)
         srv.server_close()
 
 
-def test_chat_endpoint_defaults_to_template_explain_one_llm_call(running_chat_server):
+def test_chat_endpoint_never_calls_llm_returns_options(running_chat_server):
+    # Round 8: POST /api/chat must never make the automatic LLM spec call -- a question the
+    # rule path/cache can't resolve gets clickable `options` instead (never touching the queued
+    # FakeContentBackend response meant for /api/ask).
     port, backend = running_chat_server
     status, body = _post(port, "/api/chat", {"message": "모델A 출하량 보여줘"})
     assert status == 200
-    assert body["path"] == "llm"
-    assert len(backend.calls) == 1  # spec only -- explain used the template by default
-    assert "timings" in body and "query_seconds" in body["timings"]
+    assert body["path"] == "none"
+    assert len(backend.calls) == 0
+    assert body["options"] and body["options"][-1]["action"] == "ask_ai"
 
 
-def test_chat_endpoint_explain_llm_override_via_request_body(running_chat_server):
+def test_chat_endpoint_spec_patch_runs_directly_path_button(running_chat_server):
     port, backend = running_chat_server
-    status, body = _post(port, "/api/chat",
-                          {"message": "모델A 출하량 보여줘", "explain": "llm"})
+    spec_patch = {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
+                  "regions": [], "sources": [], "period_from": None, "period_to": None,
+                  "version": "latest", "rows": ["entity"], "cols": ["period"], "chart": "table",
+                  "clarify": None}
+    status, body = _post(port, "/api/chat", {"spec_patch": spec_patch})
     assert status == 200
-    assert body["answer"] == "이것은 LLM이 만든 설명입니다."
-    assert len(backend.calls) == 2  # spec + explain both ran
+    assert body["path"] == "button"
+    assert body["table"]["rows"]
+    assert len(backend.calls) == 0  # template explain by default -- no LLM anywhere
+
+
+def test_chat_endpoint_spec_patch_explain_llm_override_via_request_body(tmp_path):
+    # its own server (not running_chat_server's shared fixture) -- a spec_patch skips spec
+    # resolution entirely, so only ONE response (the explain sentence) should ever be queued/
+    # consumed here, unlike the full-message flow's [spec, explain] queue.
+    source, db_path, settings = _seed(tmp_path)
+    backend = _FakeContentBackend([{"sentence": "이것은 LLM이 만든 설명입니다."}])
+    conn = store.connect(db_path)
+    llm = LLMClient(settings, conn, backend=backend)
+    srv = dpserver.build_server(db_path, source, settings, "127.0.0.1", 0, llm=llm)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        spec_patch = {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
+                      "regions": [], "sources": [], "period_from": None, "period_to": None,
+                      "version": "latest", "rows": ["entity"], "cols": ["period"], "chart": "table",
+                      "clarify": None}
+        status, body = _post(port, "/api/chat", {"spec_patch": spec_patch, "explain": "llm"})
+        assert status == 200
+        assert body["answer"] == "이것은 LLM이 만든 설명입니다."
+        assert len(backend.calls) == 1  # only the explain call -- spec was given directly
+    finally:
+        if srv.ask_worker is not None:
+            srv.ask_worker.stop()
+        srv.shutdown()
+        thread.join(5)
+        srv.server_close()
+
+
+def test_ask_endpoint_end_to_end_resolves_via_llm(running_chat_server):
+    import time
+
+    port, backend = running_chat_server
+    status, body = _post(port, "/api/ask", {"message": "모델A 출하량 보여줘"})
+    assert status == 202
+    job_id = body["job_id"]
+
+    result = None
+    for _ in range(50):
+        status2, result, _headers = _get(port, f"/api/ask/{job_id}")
+        assert status2 == 200
+        if result["status"] not in ("queued", "running"):
+            break
+        time.sleep(0.05)
+    assert result["status"] == "done"
+    assert result["result"]["path"] == "llm"
+    assert len(backend.calls) == 1  # spec only -- explain used the template by default
 
 
 # --- version_column (a dataset with several forecast vintages) ----------------------------------
@@ -363,6 +515,8 @@ def running_versioned_server(tmp_path):
     try:
         yield port
     finally:
+        if srv.ask_worker is not None:
+            srv.ask_worker.stop()
         srv.shutdown()
         thread.join(5)
         srv.server_close()

@@ -113,6 +113,15 @@ export interface ChatTimings {
   query_seconds: number;
 }
 
+// A clarify-button choice: `spec_patch` runs instantly via `DataplatClient.chatWithSpec`
+// (`path: "button"`, no LLM); `action: "ask_ai"` (only ever the LAST option) instead queues an
+// async job via `DataplatClient.ask` -- the only way this chat ever reaches the LLM now.
+export interface ChatOption {
+  label: string;
+  spec_patch?: Record<string, unknown>;
+  action?: "ask_ai";
+}
+
 export interface ChatResponse {
   answer: string;
   spec: Record<string, unknown> | null;
@@ -120,12 +129,61 @@ export interface ChatResponse {
   chart: ChatChart | null;
   warnings: string[];
   seconds: number;
-  // How the query spec was resolved: "rule" (deterministic, no LLM call), "cache" (a previous
-  // identical question, no LLM call), or "llm" (a spec call was made). Only "llm" can ever be
-  // slow (the shared in-house endpoint's queue) -- show a "사내 LLM 응답 대기 중..." elapsed-time
-  // indicator only when `path === "llm"`.
-  path: "rule" | "cache" | "llm";
+  // How the query spec was resolved: "rule"/"cache"/"button" never call the LLM; "llm" only
+  // happens inside an async /api/ask job now (never from a plain chat() call) -- "none" means
+  // neither the rule path nor the cache resolved it, so `options` (below) has clickable
+  // suggestions plus an "AI에게 물어보기" entry. Show a "사내 LLM 응답 대기 중..." elapsed-time
+  // indicator only while an /api/ask job's status is "running".
+  path: "rule" | "cache" | "button" | "llm" | "none";
   timings: ChatTimings;
+  // Present (non-null) only when `path === "none"` -- see `ChatOption`.
+  options: ChatOption[] | null;
+}
+
+export interface SuggestionOption {
+  label: string;
+  spec_patch: Record<string, unknown>;
+}
+
+export interface DigestEntry {
+  id: number;
+  dataset: string;
+  load_id: number;
+  kind: "version_summary" | "load_summary" | "entity_note";
+  title: string;
+  text: string;
+  table: WideResult;
+  created_at: string;
+}
+
+export interface LearnedAlias {
+  id: number;
+  dataset: string;
+  dim: "entities" | "regions" | "metrics";
+  phrase: string;
+  values: string[];
+  hit_count: number;
+  created_at: string;
+}
+
+export interface AliasesResponse {
+  // aliases.yaml's raw content, keyed by dataset -- see dataplat/aliases.py's module docstring.
+  aliases: Record<string, unknown>;
+  learned: LearnedAlias[];
+}
+
+export interface AskJobStatus {
+  id: number;
+  message: string;
+  history: ChatMessage[];
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  result: ChatResponse | null;
+  error: string | null;
+  created_at: string;
+  started_at: string | null;
+  finished_at: string | null;
+  position: number; // 1-based position among still-queued jobs; 0 once it's left the queue
+  elapsed_seconds: number;
 }
 
 export interface RefreshDatasetResult {
@@ -273,13 +331,68 @@ export class DataplatClient {
     return this.request(`/api/refresh`, { method: "POST", body: JSON.stringify({ dataset }) });
   }
 
-  // `explain`: "template" (default server-side -- instant, no LLM call) or "llm" (one extra
-  // call for a nicer sentence; slower on a busy shared endpoint).
+  // Never calls the LLM -- resolves via the rule path or the spec cache, or returns `options`
+  // (path: "none") for the caller to render as buttons. `explain`: "template" (default
+  // server-side -- instant, no LLM call) or "llm" (one extra call for a nicer sentence; only
+  // meaningful once a spec was already resolved, so it still never triggers the automatic LLM
+  // spec call this method itself never makes).
   chat(message: string, history: ChatMessage[] = [],
        explain?: "llm" | "template"): Promise<ChatResponse> {
     return this.request(`/api/chat`, {
       method: "POST",
       body: JSON.stringify({ message, history, explain }),
     });
+  }
+
+  // Runs a clarify-button/suggestion's `spec_patch` directly (`path: "button"`, no LLM).
+  // `originalMessage`, when the button came from a real question (not a plain suggestion
+  // click), lets the server's learning loop remember it for next time.
+  chatWithSpec(specPatch: Record<string, unknown>, originalMessage?: string,
+               explain?: "llm" | "template"): Promise<ChatResponse> {
+    return this.request(`/api/chat`, {
+      method: "POST",
+      body: JSON.stringify({ spec_patch: specPatch, message: originalMessage, explain }),
+    });
+  }
+
+  // 6-8 ready-to-click questions for `dataset`, each running instantly via `chatWithSpec`.
+  suggestions(dataset: string): Promise<{ suggestions: SuggestionOption[] }> {
+    return this.request(`/api/suggestions${buildQuery({ dataset })}`);
+  }
+
+  // The latest batch-generated summary for `dataset` (dataplat.digest, run after a snapshot) --
+  // [] if it hasn't run yet for this dataset.
+  digest(dataset: string): Promise<{ digests: DigestEntry[] }> {
+    return this.request(`/api/digest${buildQuery({ dataset })}`);
+  }
+
+  aliases(): Promise<AliasesResponse> {
+    return this.request(`/api/aliases`);
+  }
+
+  // Requires an admin token whenever the server isn't bound to loopback (same rule as refresh()).
+  deleteLearnedAlias(id: number): Promise<{ ok: true }> {
+    return this.request(`/api/aliases/learned/${id}`, { method: "DELETE" });
+  }
+
+  // Queues an "AI에게 물어보기" job and returns immediately -- poll askStatus(job_id) (or watch
+  // askRecent()) for the result. Requires an admin token whenever the server isn't bound to
+  // loopback (this is the only way the chat ever reaches the LLM, same protection as refresh()).
+  ask(message: string, history: ChatMessage[] = []): Promise<{ job_id: number }> {
+    return this.request(`/api/ask`, { method: "POST", body: JSON.stringify({ message, history }) });
+  }
+
+  askStatus(jobId: number): Promise<AskJobStatus> {
+    return this.request(`/api/ask/${jobId}`);
+  }
+
+  askRecent(limit = 20): Promise<{ jobs: AskJobStatus[] }> {
+    return this.request(`/api/ask${buildQuery({ recent: String(limit) })}`);
+  }
+
+  // Queued: removed, never runs. Running: discarded once its (already in-flight) LLM call
+  // returns. Requires an admin token whenever the server isn't bound to loopback.
+  cancelAsk(jobId: number): Promise<{ ok: true }> {
+    return this.request(`/api/ask/${jobId}`, { method: "DELETE" });
   }
 }

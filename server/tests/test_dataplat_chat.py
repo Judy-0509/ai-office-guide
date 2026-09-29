@@ -64,7 +64,7 @@ def test_valid_spec_returns_table_and_llm_sentence(ctx):
          "cols": ["period"], "chart": "line", "clarify": None},
         {"sentence": "모델A 출하량은 2024Q1에 100, 2024Q2에 120입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 분기별로 보여줘", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 분기별로 보여줘", explain_mode="llm")
     assert result["answer"] == "모델A 출하량은 2024Q1에 100, 2024Q2에 120입니다."
     assert result["warnings"] == []
     assert result["table"]["columns"] == ["entity", "2024Q1", "2024Q2"]
@@ -78,7 +78,7 @@ def test_entity_name_auto_corrects_within_threshold(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델 A"], "clarify": None},
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델 A 얼마야")
+    result = chat.answer_via_llm(ctx_obj, "모델 A 얼마야")
     assert result["warnings"] != ["clarify"]
     assert result["spec"]["entities"] == ["모델 A"]  # spec itself unchanged, resolution is internal
     assert result["table"] is not None
@@ -88,7 +88,7 @@ def test_unknown_entity_triggers_clarification_with_candidates(ctx):
     ctx_obj, _backend = ctx([
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["존재하지않는대상"], "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "존재하지않는대상 출하량")
+    result = chat.answer_via_llm(ctx_obj, "존재하지않는대상 출하량")
     assert result["warnings"] == ["clarify"]
     assert result["table"] is None
     assert "모델" in result["answer"]  # candidate list mentions a real entity
@@ -103,7 +103,7 @@ def test_hallucinated_optional_source_is_dropped_with_warning_not_clarified(ctx)
          "rows": ["entity"], "cols": ["period"], "clarify": None},
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
     assert result["warnings"] == ["존재하지 않는 조건 '기관Z'는 제외했습니다"]
     assert result["table"] is not None and result["table"]["rows"]
     assert len(backend.calls) == 2  # spec + explain both ran -- query was not blocked
@@ -115,7 +115,7 @@ def test_hallucinated_optional_region_is_dropped_with_warning(ctx):
          "clarify": None},
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 보여줘")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 보여줘")
     assert "존재하지 않는 조건 '없는지역'는 제외했습니다" in result["warnings"]
     assert result["table"] is not None
 
@@ -128,7 +128,7 @@ def test_entity_the_model_added_on_its_own_is_dropped_not_clarified(ctx):
          "rows": ["entity"], "cols": ["period"], "clarify": None},
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "출하량 전체 다 보여줘", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "출하량 전체 다 보여줘", explain_mode="llm")
     assert result["warnings"] == ["존재하지 않는 조건 '없는모델'는 제외했습니다"]
     assert result["table"] is not None
     assert len(backend.calls) == 2
@@ -141,7 +141,7 @@ def test_entity_the_user_explicitly_named_still_clarifies_even_mixed_with_option
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A", "없는모델"],
          "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "모델A랑 없는모델 출하량 비교해줘")
+    result = chat.answer_via_llm(ctx_obj, "모델A랑 없는모델 출하량 비교해줘")
     assert result["warnings"] == ["clarify"]
     assert result["table"] is None
     assert len(backend.calls) == 1  # explain never ran -- blocked before the query
@@ -151,7 +151,7 @@ def test_llm_clarify_field_short_circuits_before_query(ctx):
     ctx_obj, backend = ctx([
         {"dataset": "shipments", "clarify": "어떤 지표를 원하시나요?"},
     ])
-    result = chat.answer(ctx_obj, "얼마야")
+    result = chat.answer_via_llm(ctx_obj, "얼마야")
     assert result["answer"] == "어떤 지표를 원하시나요?"
     assert result["warnings"] == ["clarify"]
     assert len(backend.calls) == 1  # explain step never called
@@ -163,7 +163,7 @@ def test_bad_explanation_with_invented_number_falls_back_to_template(ctx):
          "cols": ["period"], "clarify": None},
         {"sentence": "모델A 출하량은 9999로 급증했습니다."},  # 9999 is not in the table
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
     assert len(result["warnings"]) == 1
     assert result["warnings"][0].startswith("explain_number_mismatch_used_template")
     assert "9999" in result["warnings"][0]  # debug: which number got rejected
@@ -179,7 +179,7 @@ def test_explain_backend_error_falls_back_to_template(ctx):
         BackendError("연결 실패"),
         BackendError("연결 실패"),  # MAX_ATTEMPTS retries once more before LLMError
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
     assert result["warnings"] == ["explain_failed_used_template"]
     assert result["table"] is not None
 
@@ -188,7 +188,7 @@ def test_unknown_dataset_triggers_clarification(ctx):
     ctx_obj, _backend = ctx([
         {"dataset": "존재하지않는데이터셋", "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "아무 질문")
+    result = chat.answer_via_llm(ctx_obj, "아무 질문")
     assert result["warnings"] == ["clarify"]
     assert "데이터셋" in result["answer"]
 
@@ -197,7 +197,7 @@ def test_spec_call_failure_returns_clarify_not_500(ctx):
     from aioffice.llm import BackendError
 
     ctx_obj, _backend = ctx([BackendError("연결 실패"), BackendError("연결 실패")])
-    result = chat.answer(ctx_obj, "아무 질문")
+    result = chat.answer_via_llm(ctx_obj, "아무 질문")
     assert result["warnings"] == ["clarify"]
     assert result["spec"] is None
 
@@ -207,7 +207,7 @@ def test_no_rows_returns_no_data_message_without_llm_explain_call(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
          "period_from": "20990000", "period_to": "20990000", "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "2099년 출하량")
+    result = chat.answer_via_llm(ctx_obj, "2099년 출하량")
     assert result["table"]["rows"] == []
     assert len(backend.calls) == 1  # explain skipped: nothing to explain
 
@@ -255,7 +255,7 @@ def test_spec_version_label_resolves_to_that_versions_data(versioned_ctx):
          "version": "2026-07", "clarify": None},
         {"sentence": "모델A 출하량전망은 100입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 7월 버전 출하량전망 보여줘")
+    result = chat.answer_via_llm(ctx_obj, "모델A 7월 버전 출하량전망 보여줘")
     assert result["table"]["rows"] == [["모델A", 100.0]]
 
 
@@ -264,7 +264,7 @@ def test_spec_version_defaults_to_latest_when_omitted(versioned_ctx):
         {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"], "clarify": None},
         {"sentence": "모델A 출하량전망은 120입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량전망 보여줘")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량전망 보여줘")
     assert result["table"]["rows"] == [["모델A", 120.0]]
 
 
@@ -273,7 +273,7 @@ def test_spec_unknown_version_label_clarifies_with_candidates(versioned_ctx):
         {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"],
          "version": "2099-01", "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "모델A 2099년 버전 출하량전망")
+    result = chat.answer_via_llm(ctx_obj, "모델A 2099년 버전 출하량전망")
     assert result["warnings"] == ["clarify"]
     assert "2026-07" in result["answer"] and "2026-08" in result["answer"]
     assert len(backend.calls) == 1  # explain never ran
@@ -285,7 +285,7 @@ def test_spec_version_label_auto_corrects_near_miss(versioned_ctx):
          "version": "2026-07 ", "clarify": None},  # trailing space -- not an exact match
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 7월 버전 출하량전망")
+    result = chat.answer_via_llm(ctx_obj, "모델A 7월 버전 출하량전망")
     assert result["warnings"] != ["clarify"]
     assert result["table"]["rows"] == [["모델A", 100.0]]
 
@@ -296,7 +296,7 @@ def test_spec_version_history_shows_one_point_per_label(versioned_ctx):
          "version": "history", "period_to": "2026Q3", "clarify": None},
         {"sentence": "모델A 출하량전망은 100에서 120으로 늘었습니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량전망 버전별로 어떻게 바뀌었어?")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량전망 버전별로 어떻게 바뀌었어?")
     assert result["table"]["columns"] == ["load_id", "label", "value"]
     assert [r[1] for r in result["table"]["rows"]] == ["2026-07", "2026-08"]
     assert [r[2] for r in result["table"]["rows"]] == [100.0, 120.0]
@@ -311,7 +311,7 @@ def test_spec_version_history_with_multiple_entities_warns_and_uses_first(versio
          "version": "history", "period_to": "2026Q3", "clarify": None},
         {"sentence": "모델A 출하량전망은 100에서 120으로 늘었습니다."},
     ])
-    result = chat.answer(ctx_obj, "지난 버전 대비 가장 많이 바뀐 모델은?")
+    result = chat.answer_via_llm(ctx_obj, "지난 버전 대비 가장 많이 바뀐 모델은?")
     assert any("모델A" in w and "하나의 대상만" in w for w in result["warnings"])
     assert [r[1] for r in result["table"]["rows"]] == ["2026-07", "2026-08"]
     assert [r[2] for r in result["table"]["rows"]] == [100.0, 120.0]  # 모델A only, not 모델B
@@ -329,7 +329,7 @@ def test_spec_version_diff_compares_all_entities_ranked_by_abs_diff(versioned_ct
          "version": "diff", "rows": ["entity"], "clarify": None},
         {"sentence": "모델C가 300에서 200으로 가장 많이 줄었습니다."},
     ])
-    result = chat.answer(ctx_obj, "지난 버전 대비 가장 많이 바뀐 모델은?", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "지난 버전 대비 가장 많이 바뀐 모델은?", explain_mode="llm")
     assert result["table"]["columns"] == ["entity", "old", "new", "diff", "pct"]
     assert [r[0] for r in result["table"]["rows"]] == ["모델C", "모델B", "모델A"]
     assert result["answer"] == "모델C가 300에서 200으로 가장 많이 줄었습니다."
@@ -342,7 +342,7 @@ def test_spec_version_diff_defaults_to_entity_when_no_rows_given(versioned_ctx):
         {"dataset": "forecast", "metrics": ["출하량전망"], "version": "diff", "clarify": None},
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "지난 버전 대비 뭐가 바뀌었어?")
+    result = chat.answer_via_llm(ctx_obj, "지난 버전 대비 뭐가 바뀌었어?")
     assert result["table"]["columns"][0] == "entity"
     assert len(result["table"]["rows"]) == 3
 
@@ -363,7 +363,7 @@ def test_spec_version_diff_explicit_from_to_labels(versioned_ctx):
          "from": "2026-07", "to": "2026-08", "rows": ["entity"], "clarify": None},
         {"sentence": "요약입니다."},
     ])
-    result = chat.answer(ctx_obj, "7월 버전과 8월 버전 비교해줘")
+    result = chat.answer_via_llm(ctx_obj, "7월 버전과 8월 버전 비교해줘")
     assert result["spec"]["from"] == "2026-07" and result["spec"]["to"] == "2026-08"
     assert len(result["table"]["rows"]) == 3
 
@@ -373,7 +373,7 @@ def test_spec_version_diff_unknown_from_label_clarifies(versioned_ctx):
         {"dataset": "forecast", "metrics": ["출하량전망"], "version": "diff",
          "from": "2020-01", "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "2020년 버전이랑 비교해줘")
+    result = chat.answer_via_llm(ctx_obj, "2020년 버전이랑 비교해줘")
     assert result["warnings"] == ["clarify"]
     assert "2026-07" in result["answer"] and "2026-08" in result["answer"]
     assert len(backend.calls) == 1  # explain never ran
@@ -383,7 +383,7 @@ def test_spec_version_diff_on_unversioned_dataset_clarifies(ctx):
     ctx_obj, backend = ctx([
         {"dataset": "shipments", "metrics": ["출하량"], "version": "diff", "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "지난 버전 대비 뭐가 바뀌었어?")
+    result = chat.answer_via_llm(ctx_obj, "지난 버전 대비 뭐가 바뀌었어?")
     assert result["warnings"] == ["clarify"]
     assert len(backend.calls) == 1
 
@@ -396,7 +396,7 @@ def test_spec_version_diff_same_from_and_to_is_a_degenerate_zero_diff(versioned_
          "to": "2026-07", "from": "2026-07", "rows": ["entity"], "clarify": None},
         {"sentence": "변화가 없습니다."},
     ])
-    result = chat.answer(ctx_obj, "7월 버전을 7월 버전과 비교해줘")
+    result = chat.answer_via_llm(ctx_obj, "7월 버전을 7월 버전과 비교해줘")
     assert result["table"] is not None
     assert all(r[3] == 0.0 for r in result["table"]["rows"])
 
@@ -418,7 +418,7 @@ def test_spec_version_diff_no_previous_version_clarifies(tmp_path):
     ])
     llm = LLMClient(settings, conn, backend=backend)
     ctx_obj = chat.ChatContext(conn=conn, llm=llm)
-    result = chat.answer(ctx_obj, "지난 버전 대비 뭐가 바뀌었어?")
+    result = chat.answer_via_llm(ctx_obj, "지난 버전 대비 뭐가 바뀌었어?")
     assert result["warnings"] == ["clarify"]
     assert len(backend.calls) == 1
 
@@ -475,7 +475,7 @@ def test_live_bug_repro_llm_sentence_with_trailing_zeros_now_passes(ctx):
          "cols": ["period"], "clarify": None},
         {"sentence": "모델A는 2024Q1에 100.0, 2024Q2에 120.0을 기록했습니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 보여줘", explain_mode="llm")
     assert result["answer"] == "모델A는 2024Q1에 100.0, 2024Q2에 120.0을 기록했습니다."
     assert result["warnings"] == []
 
@@ -551,6 +551,20 @@ def test_template_wide_includes_unit():
     assert "80대" in sentence
 
 
+def test_template_wide_single_cell_uses_colon_format():
+    # a single value must be named directly -- not "최댓값: X, 최솟값: X" (the same cell twice).
+    table = {"columns": ["entity", "2025Q3"], "rows": [["모델A", 120.0]]}
+    sentence = chat._template_wide(table, ["entity"], "대")
+    assert sentence == "모델A 2025Q3: 120대."
+
+
+def test_template_wide_single_row_trend_shows_first_last_and_peak():
+    table = {"columns": ["entity", "2025Q1", "2025Q2", "2025Q3", "2025Q4"],
+             "rows": [["모델A", 100.0, 110.0, 120.0, 130.0]]}
+    sentence = chat._template_wide(table, ["entity"], "대")
+    assert sentence == "모델A: 2025Q1 100대 → 2025Q4 130대 (최고 2025Q4 130대)."
+
+
 def test_template_wide_no_numeric_cells_falls_back_to_count():
     table = {"columns": ["entity"], "rows": [["모델A"], ["모델B"]]}
     assert chat._template_wide(table, ["entity"], "") == "조건에 맞는 데이터가 2건 있습니다."
@@ -567,7 +581,7 @@ def test_rollup_and_agg_spec_fields_group_periods_before_pivoting(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
          "rollup": "year", "agg": "sum", "rows": ["entity"], "cols": ["period"], "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "연간 합계 좀")
+    result = chat.answer_via_llm(ctx_obj, "연간 합계 좀")
     assert result["table"]["columns"] == ["entity", "2024"]
     assert result["table"]["rows"] == [["모델A", 220.0]]  # 100 (Q1) + 120 (Q2)
 
@@ -577,7 +591,7 @@ def test_rollup_omitted_leaves_periods_untouched(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
          "rows": ["entity"], "cols": ["period"], "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "표로 보여줘")
+    result = chat.answer_via_llm(ctx_obj, "표로 보여줘")
     assert result["table"]["columns"] == ["entity", "2024Q1", "2024Q2"]
 
 
@@ -587,7 +601,7 @@ def test_missing_entity_warning_when_one_of_several_has_no_rows_in_period(ctx):
          "period_from": "2024Q2", "period_to": "2024Q2", "rows": ["entity"], "cols": ["period"],
          "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "이 기간 표로 보여줘")
+    result = chat.answer_via_llm(ctx_obj, "이 기간 표로 보여줘")
     # 모델B has no 2024Q2 row at all (only 모델A does) -- must warn, not silently show a smaller table
     assert "'모델B'은(는) 해당 기간 데이터가 없습니다" in result["warnings"]
 
@@ -597,7 +611,7 @@ def test_missing_entity_warning_absent_when_all_requested_entities_have_rows(ctx
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
          "rows": ["entity"], "cols": ["period"], "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "표로 보여줘")
+    result = chat.answer_via_llm(ctx_obj, "표로 보여줘")
     assert result["warnings"] == []
 
 
@@ -606,7 +620,7 @@ def test_default_explain_mode_is_template_skips_llm_explain_call(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "rows": ["entity"],
          "cols": ["period"], "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량 보여줘")  # explain_mode not given -> "template"
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량 보여줘")  # explain_mode not given -> "template"
     assert len(backend.calls) == 1  # spec only -- no LLM explain call
     assert result["timings"]["explain_seconds"] == 0.0
     assert result["answer"]  # the template sentence, not empty
@@ -617,15 +631,27 @@ def test_response_carries_path_and_timings_on_llm_spec_path(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "rows": ["entity"],
          "cols": ["period"], "clarify": None},
     ])
-    result = chat.answer(ctx_obj, "이 데이터 좀 봐줘 아무거나")
+    result = chat.answer_via_llm(ctx_obj, "이 데이터 좀 봐줘 아무거나")
     assert result["path"] == "llm"
     assert set(result["timings"]) == {"spec_seconds", "explain_seconds", "query_seconds"}
     assert result["timings"]["spec_seconds"] >= 0.0
 
 
+def test_sync_answer_never_calls_llm_returns_none_path_with_options(ctx):
+    # Round 8: POST /api/chat (chat.answer) must never make the automatic LLM spec call -- when
+    # the rule path/cache can't resolve it, it returns clickable `options` instead (ending with
+    # "AI에게 물어보기"), and the FakeContentBackend is never touched.
+    ctx_obj, backend = ctx([])
+    result = chat.answer(ctx_obj, "이 데이터 좀 봐줘 아무거나")
+    assert result["path"] == "none"
+    assert len(backend.calls) == 0
+    assert result["options"] is not None
+    assert result["options"][-1] == chat.ASK_AI_OPTION
+
+
 def test_clarify_responses_also_carry_path_and_timings(ctx):
     ctx_obj, _backend = ctx([{"dataset": "존재하지않는데이터셋", "clarify": None}])
-    result = chat.answer(ctx_obj, "아무 질문")
+    result = chat.answer_via_llm(ctx_obj, "아무 질문")
     assert result["path"] == "llm"
     assert result["timings"]["explain_seconds"] == 0.0
     assert result["timings"]["query_seconds"] == 0.0
@@ -639,7 +665,7 @@ def test_spec_call_timeout_returns_friendly_busy_message(ctx):
         BackendError("direct timeout: ReadTimeout"),
         BackendError("direct timeout: ReadTimeout"),  # MAX_ATTEMPTS retries once more
     ])
-    result = chat.answer(ctx_obj, "이 데이터 좀 보여줘 아무거나")
+    result = chat.answer_via_llm(ctx_obj, "이 데이터 좀 보여줘 아무거나")
     assert "붐벼서" in result["answer"]
     assert result["spec"] is None
     assert result["path"] == "llm"
@@ -650,11 +676,13 @@ def test_spec_call_timeout_returns_friendly_busy_message(ctx):
 
 
 def test_repeated_message_hits_cache_and_skips_the_llm_spec_call(ctx):
+    # realistic Round 8 flow: an /api/ask job (answer_via_llm) resolves and caches a spec once;
+    # a later live chat.answer() call for the SAME question then hits that cache, no LLM call.
     ctx_obj, backend = ctx([
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "rows": ["entity"],
          "cols": ["period"], "clarify": None},
     ])
-    first = chat.answer(ctx_obj, "이 데이터 좀 봐줘 아무거나")
+    first = chat.answer_via_llm(ctx_obj, "이 데이터 좀 봐줘 아무거나")
     assert first["path"] == "llm" and len(backend.calls) == 1
 
     second = chat.answer(ctx_obj, "이 데이터 좀 봐줘 아무거나")  # same message, same catalog
@@ -670,7 +698,7 @@ def test_cache_misses_after_catalog_version_changes(ctx):
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "rows": ["entity"],
          "cols": ["period"], "clarify": None},
     ])
-    first = chat.answer(ctx_obj, "이 데이터 좀 봐줘 아무거나")
+    first = chat.answer_via_llm(ctx_obj, "이 데이터 좀 봐줘 아무거나")
     assert first["path"] == "llm"
 
     new_rows = [{"metric": "출하량", "entity": "모델A", "region": "", "period": "2024Q3",
@@ -679,12 +707,12 @@ def test_cache_misses_after_catalog_version_changes(ctx):
                       observations=new_rows, report={}, started_at=store.now_iso(),
                       finished_at=store.now_iso())  # a new snapshot changes catalog_version
 
-    second = chat.answer(ctx_obj, "이 데이터 좀 봐줘 아무거나")
+    second = chat.answer_via_llm(ctx_obj, "이 데이터 좀 봐줘 아무거나")
     assert second["path"] == "llm"  # cache scoped to the old catalog_version -> miss
     assert len(backend.calls) == 2
 
 
-def test_multiturn_history_bypasses_rule_path_and_cache(ctx):
+def test_multiturn_history_bypasses_rule_path_and_cache_in_answer_via_llm(ctx):
     ctx_obj, backend = ctx([
         {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "rows": ["entity"],
          "cols": ["period"], "clarify": None},
@@ -692,10 +720,21 @@ def test_multiturn_history_bypasses_rule_path_and_cache(ctx):
          "cols": ["period"], "clarify": None},
     ])
     turn = [{"role": "user", "content": "이전 대화"}]
-    first = chat.answer(ctx_obj, "모델A 지난 버전 대비 얼마나 바뀌었어", history=turn)
-    second = chat.answer(ctx_obj, "모델A 지난 버전 대비 얼마나 바뀌었어", history=turn)
+    first = chat.answer_via_llm(ctx_obj, "모델A 지난 버전 대비 얼마나 바뀌었어", history=turn)
+    second = chat.answer_via_llm(ctx_obj, "모델A 지난 버전 대비 얼마나 바뀌었어", history=turn)
     assert first["path"] == "llm" and second["path"] == "llm"  # never "rule" or "cache" with history
     assert len(backend.calls) == 2
+
+
+def test_sync_answer_with_history_skips_straight_to_options_never_llm(ctx):
+    # Round 8: multi-turn messages in the SYNC path never touch the LLM either -- they go
+    # straight to the clarify/suggestions response, same as a single-turn rule/cache miss.
+    ctx_obj, backend = ctx([])
+    turn = [{"role": "user", "content": "이전 대화"}]
+    result = chat.answer(ctx_obj, "모델A 지난 버전 대비 얼마나 바뀌었어", history=turn)
+    assert result["path"] == "none"
+    assert len(backend.calls) == 0
+    assert result["options"] is not None
 
 
 # --- rule-based fast path (no LLM): ~25 Korean question table, incl. fallback cases -------------
@@ -831,6 +870,147 @@ def test_diff_on_unversioned_dataset_with_single_named_entity_reinterpreted_as_h
          "period_to": "2024Q1", "clarify": None},
         {"sentence": "모델A 출하량은 100입니다."},
     ])
-    result = chat.answer(ctx_obj, "모델A 출하량이 이전 스냅샷 대비 어떻게 바뀌었어?")
+    result = chat.answer_via_llm(ctx_obj, "모델A 출하량이 이전 스냅샷 대비 어떻게 바뀌었어?")
     assert result["warnings"] != ["clarify"]
     assert result["table"]["columns"] == ["load_id", "label", "value"]
+
+
+# --- Round 8: suggestions, clarify buttons, answer_with_spec, aliases, learning loop -------------
+
+
+def test_build_suggestions_unversioned_dataset_has_no_diff_option(ctx):
+    ctx_obj, _backend = ctx([])
+    suggestions = chat.build_suggestions(ctx_obj.conn, "shipments")
+    assert suggestions
+    assert all("spec_patch" in s and "label" in s for s in suggestions)
+    assert not any(s["spec_patch"]["version"] == "diff" for s in suggestions)
+
+
+def test_build_suggestions_versioned_dataset_includes_diff_option(versioned_ctx):
+    ctx_obj, _backend = versioned_ctx([])
+    suggestions = chat.build_suggestions(ctx_obj.conn, "forecast")
+    assert any(s["spec_patch"]["version"] == "diff" for s in suggestions)
+
+
+def test_build_suggestions_unknown_dataset_is_empty(ctx):
+    ctx_obj, _backend = ctx([])
+    assert chat.build_suggestions(ctx_obj.conn, "no_such_dataset") == []
+
+
+def test_clarify_button_options_matches_entity_to_options(ctx):
+    ctx_obj, backend = ctx([])
+    full_catalog = store.catalog(ctx_obj.conn)
+    options = chat._clarify_button_options(ctx_obj.conn, "모델A 얼마?", full_catalog, {})
+    assert options[-1] == chat.ASK_AI_OPTION
+    assert any("모델A" in o["label"] for o in options[:-1])
+    assert len(backend.calls) == 0
+
+
+def test_clarify_button_options_falls_back_to_suggestions_when_nothing_matches(ctx):
+    ctx_obj, _backend = ctx([])
+    full_catalog = store.catalog(ctx_obj.conn)
+    options = chat._clarify_button_options(ctx_obj.conn, "아무 말이나 해볼게요", full_catalog, {})
+    assert options[-1] == chat.ASK_AI_OPTION
+    assert len(options) > 1  # dataset-level suggestions + ask_ai
+
+
+def test_answer_with_spec_runs_directly_path_button(ctx):
+    ctx_obj, backend = ctx([])
+    spec = {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
+            "regions": [], "sources": [], "period_from": None, "period_to": None,
+            "version": "latest", "rows": ["entity"], "cols": ["period"], "chart": "table",
+            "clarify": None}
+    result = chat.answer_with_spec(ctx_obj, spec)
+    assert result["path"] == "button"
+    assert result["table"]["rows"] == [["모델A", 100.0, 120.0]]
+    assert len(backend.calls) == 0  # no LLM anywhere in this path
+
+
+def test_answer_with_spec_with_original_message_feeds_learning_loop(ctx):
+    ctx_obj, _backend = ctx([])
+    spec = {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A", "모델B"],
+            "regions": [], "sources": [], "period_from": None, "period_to": None,
+            "version": "latest", "rows": ["entity"], "cols": ["period"], "chart": "table",
+            "clarify": None}
+    chat.answer_with_spec(ctx_obj, spec, original_message="국산 라인업 다 보여줘")
+    learned = store.list_learned_aliases(ctx_obj.conn, "shipments")
+    assert len(learned) == 1
+    assert set(learned[0]["values"]) == {"모델A", "모델B"}
+
+
+def test_answer_with_spec_no_original_message_does_not_learn(ctx):
+    ctx_obj, _backend = ctx([])
+    spec = {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
+            "regions": [], "sources": [], "period_from": None, "period_to": None,
+            "version": "latest", "rows": ["entity"], "cols": ["period"], "chart": "table",
+            "clarify": None}
+    chat.answer_with_spec(ctx_obj, spec)  # a plain suggestion click -- no original_message
+    assert store.list_learned_aliases(ctx_obj.conn) == []
+
+
+def test_answer_via_llm_learns_new_alias_from_llm_resolved_entities(ctx):
+    ctx_obj, _backend = ctx([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A", "모델B"],
+         "rows": ["entity"], "cols": ["period"], "clarify": None},
+    ])
+    chat.answer_via_llm(ctx_obj, "국산 라인업 다 보여줘")
+    learned = store.list_learned_aliases(ctx_obj.conn, "shipments")
+    assert len(learned) == 1
+    assert set(learned[0]["values"]) == {"모델A", "모델B"}
+
+
+def test_answer_via_llm_never_learns_from_empty_result(ctx):
+    ctx_obj, _backend = ctx([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"],
+         "period_from": "2099", "period_to": "2099", "clarify": None},
+    ])
+    chat.answer_via_llm(ctx_obj, "국산 라인업 2099년 실적")
+    assert store.list_learned_aliases(ctx_obj.conn) == []
+
+
+def test_build_alias_maps_includes_learned_aliases(ctx):
+    ctx_obj, _backend = ctx([])
+    store.upsert_learned_alias(ctx_obj.conn, dataset="shipments", dim="entities",
+                                phrase="국산라인업", values=["모델A", "모델B"])
+    full_catalog = store.catalog(ctx_obj.conn)
+    alias_maps = chat.build_alias_maps(ctx_obj.conn, None, full_catalog)
+    assert alias_maps["shipments"]["entities"]["국산라인업"] == ["모델A", "모델B"]
+
+
+def test_learned_alias_then_resolves_via_rule_path(ctx):
+    # closes the learning loop end to end: a phrase learned from a previous LLM/button
+    # resolution makes an IDENTICAL later question resolve via the rule path, no LLM call.
+    ctx_obj, backend = ctx([])
+    store.upsert_learned_alias(ctx_obj.conn, dataset="shipments", dim="entities",
+                                phrase=chat._norm_for_match("국산라인업 2024Q1 얼마야"),
+                                values=["모델A"])
+    result = chat.answer(ctx_obj, "국산라인업 2024Q1 얼마야")
+    assert result["path"] == "rule"
+    assert len(backend.calls) == 0
+    assert result["table"]["rows"] == [["모델A", 100.0]]
+
+
+def test_answer_uses_aliases_yaml_in_rule_path(tmp_path):
+    from aioffice.dataplat import aliases as aliases_module
+
+    settings = Settings.load(None, environ={"DATA_DIR": str(tmp_path / "data")})
+    conn = store.connect(tmp_path / "dataplat.sqlite")
+    store.upsert_dataset(conn, "shipments", "출하", store.now_iso())
+    rows = [{"metric": "출하량", "entity": "모델A", "region": "", "period": "2024Q1",
+             "period_sort": "20240100", "source": "", "value": 100.0, "unit": ""}]
+    store.write_load(conn, dataset="shipments", content_hash_value=store.content_hash(rows),
+                      observations=rows, report={}, started_at=store.now_iso(),
+                      finished_at=store.now_iso())
+
+    alias_path = tmp_path / "aliases.yaml"
+    alias_path.write_text("shipments:\n  entities:\n    삼성: [\"모델A\"]\n", encoding="utf-8")
+    aliases_cfg = aliases_module.load_aliases(alias_path)
+
+    backend = FakeContentBackend([])
+    llm = LLMClient(settings, conn, backend=backend)
+    ctx_obj = chat.ChatContext(conn=conn, llm=llm, aliases=aliases_cfg)
+
+    result = chat.answer(ctx_obj, "삼성 2024Q1 출하량 얼마야")
+    assert result["path"] == "rule"
+    assert result["table"]["rows"] == [["모델A", 100.0]]
+    assert len(backend.calls) == 0

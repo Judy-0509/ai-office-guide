@@ -202,7 +202,11 @@ python -m aioffice.dataplat.server --db dataplat.sqlite --source source.yaml ^
 | `GET /api/version_diff?dataset=&from=&to=&metric=&entity=&region=&source=&period_from=&period_to=&group_by=&top=&sort=abs\|rel` | 두 버전 비교(3절). 기본: 최신 라벨 vs 바로 이전 라벨. `group_by`(기본 `entity`) 기준 합산 후 old/new/diff/pct 계산, 상위 `top`(기본 20)건 |
 | `GET /api/loads[?dataset=]`, `GET /api/loads/<id>` | 적재 이력 목록/상세(diff 포함 리포트) |
 | `POST /api/refresh {dataset?}`, `GET /api/refresh/status` | 스냅샷 실행(admin 토큰 필요) |
-| `POST /api/chat {message, history?, explain?}` | 챗봇. 응답에 `path`("rule"\|"cache"\|"llm")와 `timings`(`spec_seconds`/`explain_seconds`/`query_seconds`)가 함께 옵니다 — 10절 참고 |
+| `POST /api/chat {message, history?, explain?}` 또는 `{spec_patch, message?, explain?}` | 챗봇. **LLM을 자동 호출하지 않음** — 응답의 `path`(`"rule"\|"cache"\|"button"\|"none"`)와 `timings`(10절), `path:"none"`이면 `options`(12·16절) |
+| `GET /api/suggestions?dataset=` | 데이터셋별 추천 질문(`spec_patch` 포함, 클릭 시 즉시 실행) — 10·16절 |
+| `GET /api/digest?dataset=` | 최신 배치 요약(다이제스트) — 13절 |
+| `GET /api/aliases`, `DELETE /api/aliases/learned/<id>` (admin 토큰) | 별칭 설정 + 학습된 별칭 조회/삭제 — 12·15절 |
+| `POST /api/ask {message, history?}` (admin 토큰) → `202 {job_id}`, `GET /api/ask/<id>`, `DELETE /api/ask/<id>` (admin 토큰), `GET /api/ask?recent=` | 비동기 "AI에게 물어보기" — LLM이 실제로 호출되는 유일한 경로 — 14절 |
 
 읽기 엔드포인트는 인증이 필요 없습니다. `server/README.md`에 같은 표가 조금 더 자세히 있습니다.
 
@@ -241,6 +245,13 @@ React라면 `useEffect`로 마운트 시 `catalog()`/`queryWide()`를 호출하�
 됩니다(`server/README.md`의 예시 참고). 갱신 버튼은 `refresh()` 호출 후 `refreshStatus()`를
 짧은 간격으로 폴링해 `running`이 꺼지면 데이터를 다시 불러오도록 구현하세요.
 
+챗봇 3단계 경로용 메서드도 같은 클라이언트에 있습니다: `chat()`(자동으로 LLM을 부르지 않음),
+`chatWithSpec()`(버튼/추천 질문의 `spec_patch` 실행), `suggestions()`/`digest()`(대시보드 첫
+화면 카드), `ask()`/`askStatus()`/`askRecent()`/`cancelAsk()`(비동기 "AI에게 물어보기"),
+`aliases()`/`deleteLearnedAlias()`. 타입과 사용 순서는 10·12~16절과 `.ts` 파일의 주석을
+참고하세요 — `server/aioffice/dataplat/static/chat.html`이 이 모든 메서드를 실제로 쓰는
+참고 구현입니다.
+
 ## 8. 예약 등록 (팀 기존 집계 명령과 함께)
 
 ```powershell
@@ -250,7 +261,9 @@ python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
 
 매주 월요일 08:00에 `--pre` 명령(팀이 이미 쓰던 집계 실행 파일/스크립트)을 먼저 실행하고,
 **성공했을 때만** 스냅샷을 실행하는 `.cmd`가 `dataplat.sqlite` 옆에 만들어지고 그걸 Windows
-작업 스케줄러에 등록합니다. `--pre`를 생략하면 스냅샷만 등록됩니다. 로그는
+작업 스케줄러에 등록합니다. `--pre`를 생략하면 스냅샷만 등록됩니다. **스냅샷이 성공하면
+이어서 다이제스트(13절)도 자동 실행**됩니다(다이제스트가 실패해도 스냅샷의 성공/실패 판정에는
+영향을 주지 않습니다). 다이제스트는 LLM을 쓰므로 `.env`가 필요하면 `--env`를 추가하세요. 로그는
 `dataplat_run.log`(같은 폴더)에 남습니다. `schedule show`로 등록 상태, `schedule remove`로
 삭제합니다.
 
@@ -299,32 +312,50 @@ python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
 3. **스케줄 확인**: `schedule show`로 다음 실행 시각이 기대한 요일/시각인지 확인합니다.
 4. **`--admin-token` 없이 갱신이 막히는지**: `POST /api/refresh`를 토큰 없이 호출해 401이
    나오는지 한 번은 확인하세요(운영 배포 전 1회면 충분).
+5. **되물음 버튼 플로우**: 2번 항목의 "모호한 질문"이 `path:"none"` + `options`로 오는지,
+   버튼(spec_patch)을 누르면 `path:"button"`으로 즉시(LLM 호출 없이) 표가 나오는지, 마지막
+   "AI에게 물어보기" 버튼이 항상 있는지 확인합니다(10·12·16절).
+6. **`/api/ask` 왕복**: "AI에게 물어보기"를 한 번 눌러 `202`가 오는지, `GET /api/ask/<id>`를
+   몇 초 간격으로 폴링해 `queued`→`running`→`done`(또는 `error`)으로 넘어가는지, 완료된
+   `result`가 `POST /api/chat`과 같은 모양인지 확인합니다(14절). 취소(`DELETE`)도 한 번
+   테스트하세요.
+7. **다이제스트 확인**: `GET /api/digest?dataset=<이름>`에 최신 요약이 있는지, 문장에 표에
+   없는 숫자가 없는지 확인합니다(13절). 처음 연결한 데이터셋이면 비어 있는 게 정상입니다
+   (다음 스냅샷 이후 생깁니다).
+8. **별칭 점검(쓰는 경우)**: `aliases.yaml`에 적어둔 별칭 몇 개로 질문해 `path:"rule"`로
+   바로 풀리는지 확인하고, `GET /api/aliases`의 `learned`에 이상한 학습이 쌓이지 않았는지
+   가끔 훑어봅니다(12·15절).
 
-## 10. 챗봇 응답 경로와 속도 (`path`, `explain`)
+## 10. 챗봇 3단계 응답 경로 (`path`, `explain`) — `POST /api/chat`는 이제 LLM을 자동 호출하지 않습니다
 
 사내 공용 LLM 엔드포인트는 다른 사용자 요청과 큐를 공유해서, 호출 1건이 수십 초~수 분 걸릴 수
-있습니다(모델 자체는 느리지 않습니다 — 대기열 문제). `POST /api/chat` 응답의 `path` 필드로
-이번 질문이 LLM을 실제로 호출했는지 알 수 있습니다:
+있습니다(모델 자체는 느리지 않습니다 — 대기열 문제). 그래서 **사용자는 절대 LLM 대기열에서
+기다리게 하지 않는다**는 원칙으로, `POST /api/chat`(일반 채팅 입력)은 LLM을 **자동으로도
+호출하지 않습니다**. LLM은 (a) 스냅샷 후 배치로 도는 다이제스트(13절)와 (b) 사용자가 명시적으로
+누르는 "AI에게 물어보기" 버튼(14절, 비동기 `/api/ask`) 두 곳에서만 쓰입니다.
+
+`POST /api/chat` 응답의 `path` 필드:
 
 | `path` | 의미 | LLM 호출 |
 |---|---|---|
 | `"rule"` | 카탈로그 이름/기간/의도 키워드만으로 질의를 바로 만들었음(아래 표 참고) | 0회 |
-| `"cache"` | 카탈로그가 안 바뀐 상태에서 같은 질문을 이전에 이미 물어봤음 | 0회 |
-| `"llm"` | 위 두 경로가 안 되어 실제로 spec 호출을 했음 | 1회(+`explain:"llm"`이면 1회 더) |
+| `"cache"` | 카탈로그가 안 바뀐 상태에서 같은 질문을 이전에 이미 물어봤음(`/api/ask`가 예전에 풀어낸 spec 재사용 포함) | 0회 |
+| `"button"` | 되물음(clarify) 버튼이나 추천 질문(12절)을 눌러 `spec_patch`를 직접 실행함 | 0회 |
+| `"none"` | 위 세 경로 모두 못 풀었음 — 응답에 클릭 가능한 `options`(버튼 목록, 마지막은 항상 "AI에게 물어보기")가 옴. **`POST /api/chat` 자체는 여기서 끝** — LLM은 사용자가 "AI에게 물어보기"를 눌러야만(14절, `/api/ask`) 호출됩니다 | 0회 (버튼을 누르기 전까지) |
 
-**대시보드 위젯 가이드**: `path`가 `"llm"`일 때만 "사내 LLM 응답 대기 중…" 같은 경과 시간
-표시를 보여주세요(`rule`/`cache`는 즉시 응답하므로 로딩 표시가 오히려 어색합니다).
+**대시보드 위젯 가이드**: `path === "none"`이면 `options`를 버튼으로 렌더링하세요 —
+`spec_patch`가 있는 버튼은 클릭 시 `POST /api/chat {spec_patch, message}`로 즉시 재실행되고
+(`path:"button"`), `action:"ask_ai"` 버튼(항상 마지막)은 `POST /api/ask`로 넘어갑니다(14절).
+"사내 LLM 응답 대기 중…" 같은 경과 시간 표시는 `/api/ask` 작업의 상태가 `running`일 때만
+보여주세요 — `rule`/`cache`/`button`은 항상 즉시 응답하므로 로딩 표시가 오히려 어색합니다.
 
 **설명 문장은 기본이 즉시 응답(`explain`)**: `explain_seconds`가 0이면 코드가 만든 템플릿
 문장을 썼다는 뜻(항상 숫자가 맞고 LLM 호출이 없습니다) — 서버 기본값이며 `--explain llm`으로
 서버 전체 기본을 바꾸거나, 요청 본문에 `"explain":"llm"`을 넣어 그 질문만 LLM 설명을 받을 수
-있습니다(느릴 수 있음). `timings.spec_seconds`/`explain_seconds`/`query_seconds`로 어느 단계가
-오래 걸렸는지 구분할 수 있습니다.
-
-**LLM이 너무 오래 걸리면**: `--chat-timeout`(기본 180초)이 지나면 실패로 처리하고 "지금 사내
-LLM이 붐벼서 응답이 늦습니다. 모델명·기간을 넣어 더 구체적으로 물어보시면 바로 답할 수
-있습니다"라는 안내를 돌려줍니다 — 아래 표처럼 모델명(대상)과 기간을 함께 말하면 `rule`
-경로로 즉시 답할 수 있는 질문이 많습니다.
+있습니다(스펙이 이미 rule/cache/button으로 풀린 뒤에 붙는 별도 호출이라, 이것만으로는 자동
+LLM 호출 규칙을 어기지 않습니다 — 사용자가 명시적으로 요청한 경우에만 씁니다).
+`timings.spec_seconds`/`explain_seconds`/`query_seconds`로 어느 단계가 오래 걸렸는지 구분할 수
+있습니다.
 
 **`rule` 경로로 바로 답하는 질문 유형(예시)**:
 
@@ -342,8 +373,13 @@ LLM이 붐벼서 응답이 늦습니다. 모델명·기간을 넣어 더 구체�
 차트, 전체 기간 또는 지정한 기간). "버전"이 직접 언급된 질문(지난/이전 버전, 버전 대비, "7월
 버전" 등)만 버전 비교/특정 버전 조회로 갑니다 — 서로 다른 개념이니 섞어 쓰지 마세요.
 
-대상 이름·기간 중 아무것도 못 찾았거나(카탈로그에 없는 이름 포함) 위 유형에 안 맞으면 자동으로
-`llm` 경로로 넘어갑니다 — 못 알아들어도 항상 답은 합니다, 다만 느릴 수 있습니다.
+별칭(12절)도 이 표의 이름 인식에 함께 적용됩니다 — "삼성"처럼 카탈로그에 없는 사내 용어도
+aliases.yaml에 등록해 두면 `rule` 경로로 바로 풀립니다.
+
+대상 이름·기간 중 아무것도 못 찾았거나(카탈로그에 없는 이름 포함, 별칭도 없음) 위 유형에 안
+맞으면 `path:"none"` + `options`로 응답합니다(버튼: 인식된 대상별 바로가기, 또는 아무것도
+못 찾았으면 12절의 추천 질문 + "AI에게 물어보기"). LLM은 사용자가 그 버튼을 직접 눌러야만
+(14절) 호출됩니다 — 자동으로 호출되는 경로는 없습니다.
 
 ## 11. 문제 해결
 
@@ -357,4 +393,110 @@ LLM이 붐벼서 응답이 늦습니다. 모델명·기간을 넣어 더 구체�
 | `version_column`을 쓰는 데이터셋의 값이 뒤섞여 보임 | 뷰가 그 컬럼을 실제로 내보내는지(3절), `source.yaml`의 `version_column` 이름이 뷰 출력 컬럼명(rename 적용 후)과 정확히 일치하는지 확인 — 다르면 스냅샷이 바로 `ValueError`로 실패합니다(조용히 섞이지 않음) |
 | 특정 버전이 안 보임/최신이 예상과 다름 | `GET /api/catalog`의 `version_labels`로 실제 저장된 버전 목록을 확인. `YYYY-MM` 형식이 아닌 버전 이름(예: "draft")은 시간순이 아니라 처음 적재된 순서로 정렬됩니다(3절) |
 | 분기 데이터인데 `period_from=period_to="2025"`로 물으면 빈 표 | 예전 버그 — 이제는 연 단위 경계가 그 해의 모든 분기/월/주를 포함합니다(1절 범위 규칙). 여전히 비면 `GET /api/catalog`의 `period_from`/`period_to`로 실제 저장 범위부터 확인 |
-| 챗봇 답이 항상 몇 분씩 걸림 | `path`가 계속 `"llm"`이면(10절) 질문에 대상 이름과 기간을 함께 넣어보세요 — `rule` 경로가 잡히면 즉시 답합니다. `explain`을 기본값(`template`)에서 안 바꿨는지도 확인(`"llm"`으로 바꾸면 매번 LLM 호출이 하나 더 붙습니다) |
+| 챗봇 답이 항상 몇 분씩 걸림 | `POST /api/chat`은 이제 LLM을 자동 호출하지 않습니다(10절) — 느리다면 위젯이 `explain:"llm"`을 항상 보내고 있거나, "AI에게 물어보기" 버튼(14절)을 거치는 경로를 매번 타고 있는 건 아닌지 확인하세요. `path`가 계속 `"none"`이면 질문에 대상 이름과 기간을 함께 넣어보세요 — `rule` 경로가 잡히면 즉시 답합니다 |
+| `POST /api/chat`에 물었는데 `path:"none"`만 오고 표가 안 나옴 | 정상 동작입니다(10절) — 사용자가 `options` 중 하나를 눌러야 다음 단계로 갑니다. 위젯이 `options`를 렌더링하고 있는지 확인하세요 |
+| `/api/ask` 작업이 `error`로 끝남 | `GET /api/ask/<id>`의 `error` 필드를 확인 — 서버 재시작으로 중단된 작업은 "중단됨"으로 표시됩니다(14절). LLM 타임아웃/연결 실패면 재시도하거나 질문을 더 구체적으로 바꿔 `rule` 경로로 유도하세요 |
+| 다이제스트(`/api/digest`)가 계속 비어 있음 | `dataplat.digest`가 아직 실행되지 않았을 수 있습니다(13절) — `python -m aioffice.dataplat.digest --source source.yaml --db dataplat.sqlite --env .env`를 한 번 직접 실행해 로그를 확인하세요. 예약 실행 중이라면 스냅샷이 매번 `skipped_duplicate`(변경 없음)라 다이제스트도 안 도는 정상 상황일 수 있습니다 |
+
+## 12. `aliases.yaml` — 별칭과 그룹
+
+카탈로그에 없는 사내 줄임말/코드명("삼성", "물량")을 `rule` 경로가 바로 알아듣게 하려면
+`source.yaml` 옆에 `aliases.yaml`을 둡니다(경로는 `--aliases`로 바꿀 수 있고, 없으면
+아예 안 씁니다 — 완전히 선택 사항).
+
+```yaml
+shipments:                          # source.yaml의 dataset 이름과 동일
+  entities:
+    삼성: ["모델A", "모델B"]          # 별칭 → 실제 카탈로그 이름 목록
+    갤럭시:                          # 또는 접두사로 여러 개를 한 번에
+      column: entities
+      prefix: Galaxy                # "Galaxy"로 시작하는 모든 entity 값에 매칭
+  regions:
+    중국: China
+  metrics:
+    물량: volume_mu
+    출하: volume_mu
+  groups:                           # entities와 합쳐서 적용됨(읽기 쉬우라고 구분만 함)
+    폴더블: ["모델A", "모델C"]
+```
+
+- 목록(`["모델A","모델B"]`)/문자열(`China`) 형태는 카탈로그에 실제로 있는 이름만 남기고
+  나머지는 조용히 버립니다(오래된 별칭이 있어도 에러가 나지 않습니다).
+- `{column, prefix}` 형태는 해당 차원(entities/regions/metrics)의 카탈로그 값 중 그 접두사로
+  시작하는 것을 **매번 새로 계산**합니다 — 카탈로그가 바뀌면(신제품 추가 등) 자동으로 따라갑니다.
+- 소스 테이블의 별도 속성(예: `company`)으로 그룹을 매기고 싶다면(뷰가 그 값을 extra 컬럼으로
+  내보내는 경우) 이 파일 레벨에서는 지원하지 않습니다 — `groups`에 그 시점의 목록을 손으로
+  적어두는 것으로 충분히 저렴하게 해결됩니다. 목록이 자주 바뀌는 회사라면 요청하세요(스키마
+  변경이 필요한 더 큰 작업입니다).
+- `GET /api/aliases`로 현재 설정(`aliases`)과 15절의 학습된 별칭(`learned`)을 함께 조회할 수
+  있습니다.
+
+## 13. 다이제스트 — 스냅샷 이후 자동 요약
+
+`python -m aioffice.dataplat.digest --source source.yaml --db dataplat.sqlite --env .env`는
+데이터셋마다 최근 적재를 요약합니다: `version_column`을 쓰는 데이터셋은 최신 버전과 바로 이전
+버전의 `version_diff` 상위 변경 요약("이번 버전 주요 변화 요약") + 가장 많이 바뀐 대상 최대
+5개 각각 한 줄 메모를, 안 쓰는 데이터셋은 이번 적재의 diff 리포트 기준으로 같은 걸 만듭니다.
+문장의 모든 숫자는 챗봇과 똑같은 방식으로 표와 대조 검증되고, 틀리면 코드 템플릿으로
+대체됩니다. **한 적재(load_id)당 한 번만** 생성됩니다(다시 실행해도 중복으로 쌓이지 않음).
+
+`schedule install`로 예약을 등록하면 **스냅샷이 성공했을 때만** 자동으로 이어서 실행됩니다
+(실패해도 스냅샷 자체의 성공/실패 판정에는 영향을 주지 않습니다 — 로그에만 남습니다).
+다이제스트가 LLM을 쓰므로 `.env`가 필요하면 `schedule install`에 `--env`를 추가하세요:
+
+```powershell
+python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
+  --pre "C:\team\run_aggregate.exe" --source source.yaml --db dataplat.sqlite --env .env
+```
+
+`GET /api/digest?dataset=<이름>`으로 최신 다이제스트를 조회합니다(배열 — 요약 하나 +
+대상별 메모 여러 개). 대시보드 첫 화면에 카드로 보여주기 좋습니다(위젯 가이드는 16절).
+
+## 14. AI에게 물어보기 — 비동기 `/api/ask`
+
+10절에서 본 것처럼 `POST /api/chat`은 절대 LLM을 자동 호출하지 않습니다. `rule`/`cache`/
+`button`으로도 못 푼 질문(`path:"none"`)에서 사용자가 "AI에게 물어보기" 버튼을 직접 누르면
+그때만 아래 흐름을 탑니다:
+
+1. `POST /api/ask {message, history?}` → 즉시 `202 {job_id}`. 단일 백그라운드 워커가 접수
+   순서대로(FIFO) 처리합니다 — 사내 LLM 엔드포인트 자체가 한 번에 하나씩 처리하므로 워커를
+   여러 개 둬도 소용없습니다.
+2. `GET /api/ask/<job_id>`로 상태를 폴링합니다: `{status: queued|running|done|error|cancelled,
+   position, elapsed_seconds, result?}`. `result`는 `done`일 때만 채워지고, `POST /api/chat`의
+   응답과 완전히 같은 모양입니다(`path:"llm"`).
+3. `DELETE /api/ask/<job_id>`로 취소합니다 — 대기 중이면 그냥 제거되고, 이미 실행 중이면
+   그 결과가 나와도 버려집니다(`status:"cancelled"`로 남습니다).
+4. `GET /api/ask?recent=20`으로 최근 작업 목록을 봅니다(완료 알림 배지 등에 사용).
+
+작업은 `dataplat.sqlite`에 저장되므로 서버를 재시작해도 이미 끝난 작업의 결과는 남아
+있습니다. 재시작 시점에 `running`이던 작업(서버가 죽으면서 중단된 것)은 자동으로
+`error`("중단됨")로 정리됩니다. `POST /api/ask`/`DELETE /api/ask/<id>`는 `POST /api/refresh`와
+같은 규칙으로 `--admin-token`이 필요합니다(비loopback 배포 시).
+
+## 15. 학습된 별칭(Learned Aliases) 검토
+
+"AI에게 물어보기"로 LLM이 대상을 풀어낸 질문 중, `rule` 경로/12절의 별칭으로는 찾지 못했던
+이름이 있으면 그 질문 문장 전체를 새로운 별칭으로 자동 저장합니다(`learned_aliases`) — 다음에
+**똑같은 질문**이 오면 LLM 호출 없이 바로 풀립니다. 결과가 빈 표였던 질문에서는 절대 학습하지
+않습니다.
+
+`GET /api/aliases`의 `learned` 배열로 확인하고, 잘못 학습된 게 있으면
+`DELETE /api/aliases/learned/<id>`로 지웁니다(`--admin-token` 규칙은 14절과 동일). 가끔 훑어보고
+자주 나오는 패턴은 `aliases.yaml`에 손으로 옮겨 적어두면(12절) 더 명확하고 관리하기 쉽습니다 —
+학습된 별칭은 "정확히 같은 문장"에만 반응하는 반면, `aliases.yaml`은 그 단어가 포함된 모든
+질문에 반응하기 때문입니다.
+
+## 16. 위젯 연동 가이드 — 무엇을, 언제 렌더링할지
+
+| 상황 | 렌더링 |
+|---|---|
+| `POST /api/chat` 응답 `path` in `rule`/`cache`/`button` | 표/차트/문장을 바로 렌더링. 로딩 표시 불필요(항상 즉시 응답) |
+| `path === "none"` | `options`를 버튼 목록으로: `spec_patch` 있는 버튼은 클릭 시 `POST /api/chat {spec_patch, message}` 재호출, 마지막의 `action:"ask_ai"` 버튼은 14절로 |
+| "AI에게 물어보기" 버튼 클릭 | `POST /api/ask` 후 "질문이 접수되었습니다" 안내 + 대기 목록에 추가. 5초 간격 정도로 `GET /api/ask/<id>` 폴링(또는 `?recent=`로 한꺼번에) |
+| `/api/ask` 상태가 `running` | 이때만 "사내 LLM 응답 대기 중… (다른 사용자 요청과 순서를 기다리는 중)" 경과 시간 표시 |
+| `/api/ask` 상태가 `done` | 완료 알림(배지/토스트) + `result`를 `path:"rule"`과 똑같이 렌더링 |
+| 대시보드 첫 화면 | `GET /api/suggestions?dataset=`(추천 질문 버튼, `spec_patch` 포함)과 `GET /api/digest?dataset=`(최신 요약 카드)를 먼저 보여주면 사용자가 아무것도 안 물어봐도 바로 유용한 정보를 봅니다 |
+
+참고용 구현이 `server/aioffice/dataplat/static/chat.html`(`/chat`)에 있습니다 — 추천 질문 카드,
+다이제스트 카드, 되물음/추천 버튼, "AI에게 물어보기" 대기열과 폴링까지 전부 바닐라 JS로만
+구현되어 있으니 팀 React 앱에 옮길 때 참고하세요.

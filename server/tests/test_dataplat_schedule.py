@@ -48,6 +48,39 @@ def test_install_writes_wrapper_with_pre_command_gated_on_success(tmp_path):
     assert content.index("if errorlevel 1") < content.index("aioffice.dataplat.snapshot")
 
 
+def test_install_writes_wrapper_with_digest_after_snapshot(tmp_path):
+    calls = []
+    result = schedule.install(tmp_path / "source.yaml", tmp_path / "db" / "dataplat.sqlite",
+                               runner=_fake_runner(calls))
+    content = open(result["wrapper"], encoding="utf-8").read()
+    assert "aioffice.dataplat.digest" in content
+    # digest must appear AFTER the snapshot call, and be gated on the snapshot's own exit code
+    assert content.index("aioffice.dataplat.snapshot") < content.index("aioffice.dataplat.digest")
+    assert "SNAPSHOT_ERRORLEVEL" in content
+    assert "exit /b %SNAPSHOT_ERRORLEVEL%" in content  # final exit code = snapshot's, not digest's
+
+
+def test_install_with_env_path_passes_env_to_digest_only(tmp_path):
+    calls = []
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    result = schedule.install(tmp_path / "source.yaml", tmp_path / "db" / "dataplat.sqlite",
+                               runner=_fake_runner(calls), env_path=env_path)
+    content = open(result["wrapper"], encoding="utf-8").read()
+    digest_line = next(line for line in content.splitlines() if "aioffice.dataplat.digest" in line)
+    snapshot_line = next(line for line in content.splitlines() if "aioffice.dataplat.snapshot" in line)
+    assert "--env" in digest_line
+    assert "--env" not in snapshot_line  # snapshot doesn't need LLM settings
+
+
+def test_install_without_env_path_omits_env_flag(tmp_path):
+    calls = []
+    result = schedule.install(tmp_path / "source.yaml", tmp_path / "db" / "dataplat.sqlite",
+                               runner=_fake_runner(calls))
+    content = open(result["wrapper"], encoding="utf-8").read()
+    assert "--env" not in content
+
+
 def test_install_log_path_next_to_db(tmp_path):
     calls = []
     db_path = tmp_path / "db" / "dataplat.sqlite"

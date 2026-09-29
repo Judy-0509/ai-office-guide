@@ -25,7 +25,13 @@ DAYS = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
 
 
 def build_wrapper_script(python_exe: str, source_path: Path, db_path: Path,
-                          pre_command: str | None, log_path: Path) -> str:
+                          pre_command: str | None, log_path: Path,
+                          env_path: Path | None = None) -> str:
+    """Snapshot, then -- only if it succeeded -- a digest run (dataplat.digest). A digest
+    failure is logged but never changes the wrapper's own exit code (%SNAPSHOT_ERRORLEVEL%,
+    captured right after the snapshot step): the snapshot is the part a missed run actually
+    matters for."""
+    env_arg = f' --env "{env_path}"' if env_path else ""
     lines = ["@echo off", "setlocal"]
     if pre_command:
         lines += [
@@ -38,7 +44,12 @@ def build_wrapper_script(python_exe: str, source_path: Path, db_path: Path,
     lines += [
         f'"{python_exe}" -m aioffice.dataplat.snapshot --source "{source_path}" '
         f'--db "{db_path}" >> "{log_path}" 2>&1',
-        "exit /b %ERRORLEVEL%",
+        "set SNAPSHOT_ERRORLEVEL=%ERRORLEVEL%",
+        "if %SNAPSHOT_ERRORLEVEL% EQU 0 (",
+        f'  "{python_exe}" -m aioffice.dataplat.digest --source "{source_path}" '
+        f'--db "{db_path}"{env_arg} >> "{log_path}" 2>&1',
+        ")",
+        "exit /b %SNAPSHOT_ERRORLEVEL%",
     ]
     return "\r\n".join(lines) + "\r\n"
 
@@ -58,7 +69,7 @@ def show_argv() -> list[str]:
 
 def install(source: Path, db: Path, *, day: str = "MON", time_: str = "08:00",
             pre_command: str | None = None, python_exe: str = sys.executable,
-            runner: Callable[..., Any] = subprocess.run) -> dict:
+            runner: Callable[..., Any] = subprocess.run, env_path: Path | None = None) -> dict:
     if day not in DAYS:
         raise ValueError(f"--day는 {DAYS} 중 하나여야 합니다: {day!r}")
     db = Path(db).resolve()
@@ -66,7 +77,8 @@ def install(source: Path, db: Path, *, day: str = "MON", time_: str = "08:00",
     wrapper_path = db.parent / WRAPPER_NAME
     log_path = db.parent / LOG_NAME
     wrapper_path.write_text(
-        build_wrapper_script(python_exe, Path(source).resolve(), db, pre_command, log_path),
+        build_wrapper_script(python_exe, Path(source).resolve(), db, pre_command, log_path,
+                              env_path=Path(env_path).resolve() if env_path else None),
         encoding="utf-8",
     )
     result = runner(install_argv(wrapper_path, day, time_), capture_output=True, text=True)
@@ -105,13 +117,16 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--pre", default=None, dest="pre_command", help="스냅샷 전에 실행할 기존 집계 명령")
     parser.add_argument("--source", default=None, help="source.yaml 경로 (install 시 필수)")
     parser.add_argument("--db", default=None, help="dataplat.sqlite 경로 (install 시 필수)")
+    parser.add_argument("--env", default=None,
+                         help=".env 경로 (다이제스트의 LLM 설정용 -- 스냅샷 성공 후에만 실행됨)")
     args = parser.parse_args(argv)
 
     if args.action == "install":
         if not args.source or not args.db:
             parser.error("install에는 --source와 --db가 필요합니다")
         result = install(Path(args.source), Path(args.db), day=args.day, time_=args.time_,
-                          pre_command=args.pre_command)
+                          pre_command=args.pre_command,
+                          env_path=Path(args.env) if args.env else None)
         ok = result["returncode"] == 0
         print(f"래퍼 스크립트: {result['wrapper']}", flush=True)
         print(f"로그 파일: {result['log']}", flush=True)

@@ -20,6 +20,8 @@ from typing import Any, Callable
 from ..llm.client import LLMClient, LLMError
 from ..numbers import normalize_number
 from . import store
+from .aliases import AliasConfig
+from .aliases import resolve_aliases as _resolve_aliases
 from .normalize import normalize_period
 
 MAX_METRICS = 40
@@ -103,6 +105,7 @@ JSON 스키마: {"sentence": "한국어 설명 한 문장"}
 class ChatContext:
     conn: Connection
     llm: LLMClient
+    aliases: AliasConfig | None = None  # aliases.yaml, see dataplat/aliases.py
 
 
 # --- trigram similarity (no LLM, no embeddings -- same technique as analyst.steps, kept local
@@ -167,6 +170,61 @@ def _find_name_matches(message: str, candidates: list[str]) -> list[str]:
     return out
 
 
+def _dedup(seq: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out = []
+    for v in seq:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _alias_matches(message: str, alias_map: dict[str, list[str]]) -> list[str]:
+    """Like `_find_name_matches`, but keys are alias phrases (aliases.yaml, or a learned alias)
+    and each match expands to a list of real catalog values (e.g. "삼성" -> ["모델A", "모델B"]).
+    Longest phrase first, so a more specific alias wins."""
+    norm_message = _norm_for_match(message)
+    out: list[str] = []
+    for phrase in sorted(alias_map, key=len, reverse=True):
+        norm_phrase = _norm_for_match(phrase)
+        if norm_phrase and norm_phrase in norm_message:
+            out.extend(alias_map[phrase])
+    return _dedup(out)
+
+
+# AliasMaps: {dataset: {"entities"|"regions"|"metrics": {phrase: [catalog values]}}}
+AliasMaps = dict[str, dict[str, dict[str, list[str]]]]
+
+
+def build_alias_maps(conn: Connection, aliases_cfg: AliasConfig | None,
+                      full_catalog: list[dict]) -> AliasMaps:
+    """Combines `aliases.yaml` (if configured) with learned aliases (DB, Round 8's learning
+    loop) into one lookup the rule path and the clarify-button builder both use. Hand-written
+    aliases.yaml entries win over a learned one on the same phrase."""
+    learned_by_dataset: dict[str, list[dict]] = {}
+    for row in store.list_learned_aliases(conn):
+        learned_by_dataset.setdefault(row["dataset"], []).append(row)
+
+    out: AliasMaps = {}
+    for ds in full_catalog:
+        name = ds["name"]
+        per_dim: dict[str, dict[str, list[str]]] = {}
+        for dim, catalog_values in (("entities", ds["entities"]), ("regions", ds["regions"]),
+                                     ("metrics", ds["metrics"])):
+            merged = (dict(_resolve_aliases(aliases_cfg, name, dim, catalog_values))
+                      if aliases_cfg is not None else {})
+            for row in learned_by_dataset.get(name, []):
+                if row["dim"] != dim or row["phrase"] in merged:
+                    continue
+                filtered = [v for v in row["values"] if v in catalog_values]
+                if filtered:
+                    merged[row["phrase"]] = filtered
+            per_dim[dim] = merged
+        out[name] = per_dim
+    return out
+
+
 _YEAR_RANGE_KOREAN_RE = re.compile(r"((?:19|20)\d{2})년?\s*부터\s*((?:19|20)\d{2})년?\s*까지")
 _YEAR_RANGE_TILDE_RE = re.compile(r"((?:19|20)\d{2})\s*[~\-]\s*((?:19|20)\d{2})")
 # Korean-native "<year>년 <n>분기" phrasing (e.g. "2025년 3분기에") -- not a `normalize_period`
@@ -201,13 +259,23 @@ def _scan_periods(message: str) -> tuple[str | None, str | None]:
     return None, None
 
 
-def _rule_based_spec(message: str, full_catalog: list[dict]) -> dict | None:
+def _rule_based_spec(message: str, full_catalog: list[dict],
+                      alias_maps: AliasMaps | None = None) -> dict | None:
     """A deterministic spec for common question shapes, or None when not confident enough --
-    the caller then falls back to the LLM spec call."""
+    the caller then falls back to the LLM spec call. `alias_maps` (aliases.yaml + learned
+    aliases, see `build_alias_maps`) are checked alongside literal catalog names for
+    entities/regions/metrics."""
+    alias_maps = alias_maps or {}
+
+    def matches(ds_name: str, dim: str, catalog_values: list[str]) -> list[str]:
+        direct = _find_name_matches(message, catalog_values)
+        via_alias = _alias_matches(message, alias_maps.get(ds_name, {}).get(dim, {}))
+        return _dedup(direct + via_alias)
+
     per_dataset_hits: dict[str, dict[str, list[str]]] = {}
     for ds in full_catalog:
-        hits = {"entities": _find_name_matches(message, ds["entities"]),
-                "regions": _find_name_matches(message, ds["regions"]),
+        hits = {"entities": matches(ds["name"], "entities", ds["entities"]),
+                "regions": matches(ds["name"], "regions", ds["regions"]),
                 "sources": _find_name_matches(message, ds["sources"])}
         if any(hits.values()):
             per_dataset_hits[ds["name"]] = hits
@@ -225,7 +293,7 @@ def _rule_based_spec(message: str, full_catalog: list[dict]) -> dict | None:
     if len(ds["metrics"]) == 1:
         metric = ds["metrics"][0]
     else:
-        metric_hits = _find_name_matches(message, ds["metrics"])
+        metric_hits = matches(ds["name"], "metrics", ds["metrics"])
         if not metric_hits:
             return None
         metric = metric_hits[0]
@@ -277,6 +345,106 @@ def _rule_based_spec(message: str, full_catalog: list[dict]) -> dict | None:
 
 def _spec_cache_key(message: str) -> str:
     return _norm_for_match(message)
+
+
+# --- suggested questions + clarify buttons (no LLM) --------------------------------------------
+
+SUGGESTION_LIMIT = 8
+MAX_CLARIFY_OPTIONS = 6
+ASK_AI_OPTION = {"label": "AI에게 물어보기 (몇 분 걸릴 수 있음)", "action": "ask_ai"}
+
+
+def _top_entity_by_latest_total(conn: Connection, dataset: str, metric: str | None) -> str | None:
+    rows = store.query_observations(conn, dataset=dataset, metrics=[metric] if metric else None,
+                                     version="latest")
+    totals: dict[str, float] = {}
+    for r in rows:
+        if r["entity"] and isinstance(r["value"], (int, float)):
+            totals[r["entity"]] = totals.get(r["entity"], 0.0) + r["value"]
+    return max(totals, key=lambda e: totals[e]) if totals else None
+
+
+def _latest_spec(dataset: str, metric: str | None, **overrides: Any) -> dict:
+    spec = {"dataset": dataset, "metrics": [metric] if metric else [], "entities": [],
+            "regions": [], "sources": [], "period_from": None, "period_to": None,
+            "version": "latest", "rows": ["entity"], "cols": ["period"], "chart": "table",
+            "clarify": None}
+    spec.update(overrides)
+    return spec
+
+
+def build_suggestions(conn: Connection, dataset: str) -> list[dict]:
+    """Up to `SUGGESTION_LIMIT` ready-to-click questions generated from the catalog + latest
+    load, each carrying a precomputed `spec_patch` -- clicking runs it directly
+    (`answer_with_spec`, `path="button"`), no LLM and no rule-path re-matching needed. Fewer than
+    the limit is fine for a dataset that doesn't have enough distinct signal (e.g. no regions)."""
+    ds = next((d for d in store.catalog(conn) if d["name"] == dataset), None)
+    if ds is None:
+        return []
+    metric = ds["metrics"][0] if len(ds["metrics"]) == 1 else None
+    top_entity = _top_entity_by_latest_total(conn, dataset, metric)
+    out: list[dict] = []
+
+    if ds["version_labels"]:
+        out.append({"label": "지난 버전 대비 가장 많이 바뀐 항목",
+                     "spec_patch": _latest_spec(dataset, metric, version="diff", **{
+                         "from": None, "to": None, "cols": [], "chart": "bar"})})
+
+    if top_entity:
+        out.append({"label": f"{top_entity} 분기별 추이",
+                     "spec_patch": _latest_spec(dataset, metric, entities=[top_entity],
+                                                 rollup=None, agg="sum", chart="line")})
+
+    if ds["period_to"]:
+        year = ds["period_to"][:4]
+        out.append({"label": f"{year}년 항목별 합계",
+                     "spec_patch": _latest_spec(dataset, metric, period_from=year,
+                                                 period_to=year, rollup="year", agg="sum")})
+
+    if len(ds["entities"]) >= 2:
+        out.append({"label": "전체 항목 비교",
+                     "spec_patch": _latest_spec(dataset, metric, entities=ds["entities"][:6])})
+
+    if ds["regions"]:
+        top_region = ds["regions"][0]
+        out.append({"label": f"{top_region} 지역 표로 보기",
+                     "spec_patch": _latest_spec(dataset, metric, regions=[top_region])})
+
+    out.append({"label": f"{ds['title'] or dataset} 전체 표로 보기",
+                 "spec_patch": _latest_spec(dataset, metric)})
+
+    return out[:SUGGESTION_LIMIT]
+
+
+def _clarify_button_options(conn: Connection, message: str, full_catalog: list[dict],
+                             alias_maps: AliasMaps) -> list[dict]:
+    """Up to `MAX_CLARIFY_OPTIONS` clickable options for when the rule path/cache couldn't
+    resolve a full spec on their own: one option per catalog entity the message (partially)
+    matched (via a literal name or an alias), each with a ready-to-run `spec_patch`. When
+    NOTHING at all matched, falls back to dataset-level `build_suggestions()`. Always ends with
+    an "AI에게 물어보기" entry -- that's the only way the LLM gets reached from here on."""
+    candidates: list[tuple[str, dict, str]] = []
+    for ds in full_catalog:
+        alias_map = alias_maps.get(ds["name"], {}).get("entities", {})
+        for entity in _dedup(_find_name_matches(message, ds["entities"]) + _alias_matches(message, alias_map)):
+            candidates.append((ds["name"], ds, entity))
+
+    options: list[dict] = []
+    if candidates:
+        for ds_name, ds, entity in candidates[:MAX_CLARIFY_OPTIONS]:
+            metric = ds["metrics"][0] if len(ds["metrics"]) == 1 else None
+            spec_patch = _latest_spec(ds_name, metric, entities=[entity], rollup=None,
+                                       agg="sum", chart="line")
+            options.append({"label": f"{entity} 보기 ({ds['title'] or ds_name})",
+                             "spec_patch": spec_patch})
+    else:
+        for ds in full_catalog:
+            options.extend(build_suggestions(conn, ds["name"]))
+            if len(options) >= MAX_CLARIFY_OPTIONS:
+                break
+        options = options[:MAX_CLARIFY_OPTIONS]
+
+    return options + [ASK_AI_OPTION]
 
 
 # --- step 1: candidate narrowing (no LLM) -----------------------------------------------------
@@ -499,7 +667,10 @@ def _template_history(rows: list[list], entity: str, unit: str) -> str:
 
 
 def _template_wide(table: dict, row_dims: list[str], unit: str) -> str:
-    """table: {"columns": row_dims + col_headers, "rows": [...]} from `store.to_wide`."""
+    """table: {"columns": row_dims + col_headers, "rows": [...]} from `store.to_wide`. Three
+    shapes: exactly one cell -> name it directly; exactly one row (a single entity's trend
+    across periods) -> first -> last plus the peak; otherwise -> max/min across the whole
+    table (a genuine comparison, e.g. across entities)."""
     columns, rows = table.get("columns") or [], table.get("rows") or []
     row_dims_count = len(row_dims)
     col_headers = columns[row_dims_count:]
@@ -512,6 +683,16 @@ def _template_wide(table: dict, row_dims: list[str], unit: str) -> str:
                 cells.append((row[idx], row_label, str(col_label)))
     if not cells:
         return f"조건에 맞는 데이터가 {len(rows)}건 있습니다."
+    if len(cells) == 1:
+        value, row_label, col_label = cells[0]
+        return f"{row_label} {col_label}: {_num_text(value)}{unit}."
+    if len(rows) == 1:
+        row_label = " / ".join(str(v) for v in rows[0][:row_dims_count])
+        first, last = cells[0], cells[-1]
+        vmax = max(cells, key=lambda c: c[0])
+        return (f"{row_label}: {first[2]} {_num_text(first[0])}{unit} → "
+                f"{last[2]} {_num_text(last[0])}{unit} "
+                f"(최고 {vmax[2]} {_num_text(vmax[0])}{unit}).")
     vmax, vmin = max(cells, key=lambda c: c[0]), min(cells, key=lambda c: c[0])
     return (f"최댓값: {vmax[1]} {vmax[2]} {_num_text(vmax[0])}{unit}, "
             f"최솟값: {vmin[1]} {vmin[2]} {_num_text(vmin[0])}{unit}.")
@@ -587,9 +768,9 @@ _LLM_BUSY_MESSAGE = ("지금 사내 LLM이 붐벼서 응답이 늦습니다. 모
 
 
 def _clarify(question: str, spec: dict | None, started: float, *, path: str,
-             timings: dict) -> dict:
+             timings: dict, options: list[dict] | None = None) -> dict:
     return {"answer": question, "spec": spec, "table": None, "chart": None,
-            "warnings": ["clarify"], "path": path, "timings": timings,
+            "warnings": ["clarify"], "path": path, "timings": timings, "options": options,
             "seconds": round(time.perf_counter() - started, 2)}
 
 
@@ -602,52 +783,39 @@ def _missing_entities_warning(requested_entities: list[str], rows: list[dict]) -
     return [f"'{e}'은(는) 해당 기간 데이터가 없습니다" for e in requested_entities if e not in present]
 
 
-def answer(ctx: ChatContext, message: str, history: list[dict] | None = None, *,
-           explain_mode: str = "template", chat_timeout: float | None = None) -> dict:
-    """`explain_mode`: "template" (default -- instant, always number-correct, no LLM call) or
-    "llm" (one extra LLM call for a nicer sentence, falling back to the template on failure/
-    mismatch same as before). `chat_timeout`: per-call override for the shared in-house
-    endpoint's queueing delay (default `DEFAULT_CHAT_TIMEOUT_SEC`); on a spec-call timeout,
-    returns a friendly Korean message instead of the generic failure one.
+def _learn_entities(ctx: ChatContext, message: str, spec: dict, full_catalog: list[dict]) -> None:
+    """Round 8 learning loop: if `spec` names entities that the rule path (literal names +
+    current aliases) can't find in `message` on its own, remember `message` -> those entities as
+    a learned alias, so an identical question skips the LLM/button next time. Called only after
+    a query that actually returned rows (never learn from an empty result). ponytail: keys on
+    the whole normalized message rather than an extracted sub-phrase ("폴더블 라인업" out of a
+    longer sentence) -- good enough for a repeated exact question; upgrade to phrase extraction
+    if partial-message reuse turns out to matter."""
+    dataset = spec.get("dataset")
+    ds = next((d for d in full_catalog if d["name"] == dataset), None)
+    if ds is None or not spec.get("entities"):
+        return
+    known = set(_find_name_matches(message, ds["entities"]))
+    new_entities = [e for e in spec["entities"] if e in ds["entities"] and e not in known]
+    if not new_entities:
+        return
+    try:
+        store.upsert_learned_alias(ctx.conn, dataset=dataset, dim="entities",
+                                    phrase=_norm_for_match(message), values=new_entities)
+    except Exception:  # noqa: BLE001 -- the learning loop must never break a real answer
+        pass
 
-    Spec resolution tries, in order: a deterministic rule-based match (`_rule_based_spec`, no
-    LLM) -> a cached spec for this exact message + current catalog version (`chat_spec_cache`,
-    no LLM) -> the LLM spec call. Response carries which one fired as `path`. Multi-turn
-    messages (`history` non-empty) always go to the LLM -- the rule path and cache are both
-    single-turn only (neither has enough signal to resolve a follow-up like "그럼 작년은?")."""
-    started = time.perf_counter()
-    history = history or []
-    timeout = DEFAULT_CHAT_TIMEOUT_SEC if chat_timeout is None else chat_timeout
 
+def _answer_from_spec(ctx: ChatContext, spec: dict, path: str, spec_seconds: float,
+                       started: float, message: str, *, explain_mode: str, timeout: float) -> dict:
+    """Shared by every spec source (rule path, cache, a clarify-button click, and the LLM):
+    given a resolved spec + which path produced it, validates/auto-corrects names, runs the
+    query, and builds the final response including the type-aware fallback explanation.
+    `message`: the raw user text, if any (used only to tell an entity the user explicitly typed
+    from one the model/spec_patch added on its own -- see `resolve_entities`; "" for a
+    spec_patch with no free-text message behind it, e.g. a plain suggestion click)."""
     full_catalog = store.catalog(ctx.conn)
     dataset_names = [d["name"] for d in full_catalog]
-
-    spec_start = time.perf_counter()
-    path = "rule"
-    spec = None if history else _rule_based_spec(message, full_catalog)
-    cache_key = cat_version = None
-    if spec is None:
-        if not history:
-            cache_key = _spec_cache_key(message)
-            cat_version = store.catalog_version(ctx.conn)
-            spec = store.get_cached_spec(ctx.conn, cache_key, cat_version)
-        if spec is not None:
-            path = "cache"
-        else:
-            path = "llm"
-            narrowed = narrow_catalog(ctx.conn, message, history)
-            try:
-                spec = ctx.llm.complete_json(spec_messages(message, history, narrowed), SPEC_SCHEMA,
-                                              step="dataplat.spec", agent="dataplat", timeout=timeout)
-            except LLMError as exc:
-                timings = {**_ZERO_TIMINGS, "spec_seconds": round(time.perf_counter() - spec_start, 2)}
-                if "timeout" in str(exc).lower():
-                    return _clarify(_LLM_BUSY_MESSAGE, None, started, path=path, timings=timings)
-                return _clarify(f"질문을 이해하지 못했습니다. 다시 말씀해 주시겠어요? ({exc})",
-                                 None, started, path=path, timings=timings)
-            if cache_key is not None:
-                store.set_cached_spec(ctx.conn, cache_key, cat_version, spec)
-    spec_seconds = round(time.perf_counter() - spec_start, 2)
 
     def _early(question: str) -> dict:
         return _clarify(question, spec, started, path=path,
@@ -771,7 +939,111 @@ def answer(ctx: ChatContext, message: str, history: list[dict] | None = None, *,
     explain_seconds = round(time.perf_counter() - explain_start, 2)
 
     return {"answer": sentence, "spec": spec, "table": table, "chart": chart,
-            "warnings": drop_warnings + explain_warnings, "path": path,
+            "warnings": drop_warnings + explain_warnings, "path": path, "options": None,
             "timings": {"spec_seconds": spec_seconds, "explain_seconds": explain_seconds,
                         "query_seconds": query_seconds},
             "seconds": round(time.perf_counter() - started, 2)}
+
+
+def answer(ctx: ChatContext, message: str, history: list[dict] | None = None, *,
+           explain_mode: str = "template", chat_timeout: float | None = None) -> dict:
+    """Synchronous entry point for `POST /api/chat`. Never makes the automatic LLM spec call
+    (Round 8: "a user must never block on the LLM") -- spec resolution tries only the
+    deterministic rule path (`_rule_based_spec`, aliases included) and the spec cache
+    (`chat_spec_cache`). When neither resolves the question, returns a clarify response whose
+    `options` are clickable choices built from catalog/alias matches (or dataset-level
+    `build_suggestions()` when nothing at all was recognized), always ending with an "AI에게
+    물어보기" entry -- that queues a `POST /api/ask` job (`answer_via_llm`, `dataplat.ask`),
+    the only way this chat ever reaches the LLM for spec resolution now. Picking one of the
+    other options re-runs it directly via `answer_with_spec` (`path="button"`).
+
+    `explain_mode`/`chat_timeout` still control the SEPARATE, OPT-IN explanation-sentence LLM
+    call ("llm" instead of the default "template") -- unrelated to spec resolution, and left
+    alone by this round's "no automatic LLM" rule since the caller must ask for it explicitly.
+    Multi-turn messages (`history` non-empty) skip straight to the clarify/suggestions response
+    too -- the rule path and cache are both single-turn only."""
+    started = time.perf_counter()
+    history = history or []
+    timeout = DEFAULT_CHAT_TIMEOUT_SEC if chat_timeout is None else chat_timeout
+    full_catalog = store.catalog(ctx.conn)
+
+    spec_start = time.perf_counter()
+    alias_maps = build_alias_maps(ctx.conn, ctx.aliases, full_catalog)
+    spec = None if history else _rule_based_spec(message, full_catalog, alias_maps)
+    if spec is not None:
+        spec_seconds = round(time.perf_counter() - spec_start, 2)
+        return _answer_from_spec(ctx, spec, "rule", spec_seconds, started, message,
+                                  explain_mode=explain_mode, timeout=timeout)
+
+    cached = None
+    if not history:
+        cache_key = _spec_cache_key(message)
+        cat_version = store.catalog_version(ctx.conn)
+        cached = store.get_cached_spec(ctx.conn, cache_key, cat_version)
+    spec_seconds = round(time.perf_counter() - spec_start, 2)
+    if cached is not None:
+        return _answer_from_spec(ctx, cached, "cache", spec_seconds, started, message,
+                                  explain_mode=explain_mode, timeout=timeout)
+
+    options = _clarify_button_options(ctx.conn, message, full_catalog, alias_maps)
+    question = ("질문을 정확히 이해하지 못했습니다. 아래에서 골라 주시거나 AI에게 직접 "
+                "물어보세요 (몇 분 걸릴 수 있습니다).")
+    return _clarify(question, None, started, path="none",
+                     timings={**_ZERO_TIMINGS, "spec_seconds": spec_seconds}, options=options)
+
+
+def answer_via_llm(ctx: ChatContext, message: str, history: list[dict] | None = None, *,
+                    explain_mode: str = "template", chat_timeout: float | None = None) -> dict:
+    """The LLM-backed spec resolution path -- used ONLY by the async `dataplat.ask` worker
+    (never by the synchronous `answer()`/`POST /api/chat`, which must never block on the shared
+    in-house endpoint's queue). Tries the spec cache first (a job can repeat a question nobody's
+    asked live yet), then calls the LLM. Runs the Round 8 learning loop on a successful,
+    non-empty answer: any entity the LLM resolved that the rule path/aliases couldn't find in
+    `message` on their own is remembered as a learned alias."""
+    started = time.perf_counter()
+    history = history or []
+    timeout = DEFAULT_CHAT_TIMEOUT_SEC if chat_timeout is None else chat_timeout
+    full_catalog = store.catalog(ctx.conn)
+
+    spec_start = time.perf_counter()
+    cache_key = _spec_cache_key(message) if not history else None
+    cat_version = store.catalog_version(ctx.conn) if cache_key is not None else None
+    spec = store.get_cached_spec(ctx.conn, cache_key, cat_version) if cache_key is not None else None
+    path = "cache"
+    if spec is None:
+        path = "llm"
+        narrowed = narrow_catalog(ctx.conn, message, history)
+        try:
+            spec = ctx.llm.complete_json(spec_messages(message, history, narrowed), SPEC_SCHEMA,
+                                          step="dataplat.spec", agent="dataplat", timeout=timeout)
+        except LLMError as exc:
+            timings = {**_ZERO_TIMINGS, "spec_seconds": round(time.perf_counter() - spec_start, 2)}
+            if "timeout" in str(exc).lower():
+                return _clarify(_LLM_BUSY_MESSAGE, None, started, path=path, timings=timings)
+            return _clarify(f"질문을 이해하지 못했습니다. 다시 말씀해 주시겠어요? ({exc})",
+                             None, started, path=path, timings=timings)
+        if cache_key is not None:
+            store.set_cached_spec(ctx.conn, cache_key, cat_version, spec)
+    spec_seconds = round(time.perf_counter() - spec_start, 2)
+
+    result = _answer_from_spec(ctx, spec, path, spec_seconds, started, message,
+                                explain_mode=explain_mode, timeout=timeout)
+    if path == "llm" and result.get("table") and result["table"].get("rows"):
+        _learn_entities(ctx, message, spec, full_catalog)
+    return result
+
+
+def answer_with_spec(ctx: ChatContext, spec: dict, *, original_message: str | None = None,
+                      explain_mode: str = "template", chat_timeout: float | None = None) -> dict:
+    """Runs `spec` directly -- no rule/cache/LLM resolution -- for a clarify-button click or a
+    precomputed suggestion (`path="button"`). `original_message`, when given (a button click,
+    not a raw suggestion click), feeds the Round 8 learning loop the same way `answer_via_llm`
+    does: the phrase that needed a button is remembered against the entities it resolved to."""
+    started = time.perf_counter()
+    timeout = DEFAULT_CHAT_TIMEOUT_SEC if chat_timeout is None else chat_timeout
+    result = _answer_from_spec(ctx, spec, "button", 0.0, started, original_message or "",
+                                explain_mode=explain_mode, timeout=timeout)
+    if original_message and result.get("table") and result["table"].get("rows"):
+        full_catalog = store.catalog(ctx.conn)
+        _learn_entities(ctx, original_message, spec, full_catalog)
+    return result
