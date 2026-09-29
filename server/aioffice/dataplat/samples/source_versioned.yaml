@@ -1,0 +1,7 @@
+# Example source.yaml for a table that holds several forecast vintages at once (matches
+# samples/fake_source.py's build_versioned()). Without version_column, summing/averaging this
+# table would silently mix the 2026-07 and 2026-08 forecasts into one meaningless number -- see
+# 03-dataplat-manual.md.
+db: fake_source_versioned.sqlite
+view: v_dataplat_versioned
+version_column: vintage

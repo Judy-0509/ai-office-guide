@@ -2,6 +2,18 @@
 chatbot both use (catalog / query / history / loads). Write helpers commit exactly once per
 snapshot (see `dataplat.snapshot.run`) inside `aioffice.db.WRITE_LOCK`, matching the rest of the
 codebase's SQLite convention.
+
+Version labels (`source.yaml`'s optional `version_column`, e.g. forecast vintages "2026-07"/
+"2026-08" living in one source table): each load carries a `version_label` (raw text, '' when
+unused) and a `version_sort` (a TEXT key that ordering, MAX(), and grouping can all use
+directly). `version_sort` is computed once, the first time a label is ever seen for a dataset,
+by `compute_version_sort`:
+- A label that parses as a period (`normalize_period`, e.g. "2026-07" -> a month) sorts
+  chronologically: "P" + period_sort.
+- Anything else falls back to first-seen order: "F" + the ISO timestamp of the run that first
+  saw it (reused for every later load of that same label, never recomputed).
+"P" < "F" lexically, so parseable labels sort before non-parseable ones if a dataset ever somehow
+mixes both -- an edge case, not a real ordering guarantee across the two families.
 """
 from __future__ import annotations
 
@@ -51,10 +63,10 @@ def content_hash(rows: list[dict]) -> str:
 
 
 def latest_ok_load_id(conn: sqlite3.Connection, dataset: str) -> int | None:
-    row = db.fetchone(
-        conn, "SELECT MAX(id) AS id FROM loads WHERE dataset=? AND status='ok'", (dataset,)
-    )
-    return int(row["id"]) if row and row["id"] is not None else None
+    """The newest ok load of the dataset's HIGHEST version_label (see module docstring) -- the
+    same load `latest_observations` draws from."""
+    row = db.fetchone(conn, "SELECT load_id FROM latest_loads WHERE dataset=?", (dataset,))
+    return int(row["load_id"]) if row and row["load_id"] is not None else None
 
 
 def latest_content_hash(conn: sqlite3.Connection, dataset: str) -> str | None:
@@ -63,6 +75,66 @@ def latest_content_hash(conn: sqlite3.Connection, dataset: str) -> str | None:
         return None
     row = db.fetchone(conn, "SELECT content_hash FROM loads WHERE id=?", (load_id,))
     return row["content_hash"] if row else None
+
+
+def latest_content_hash_for_version(conn: sqlite3.Connection, dataset: str,
+                                     version_label: str) -> str | None:
+    """The skip-duplicate check is per version_label, not per dataset overall: a label already
+    stored with the same content is skipped even if OTHER labels of the same dataset changed."""
+    row = db.fetchone(
+        conn, "SELECT content_hash FROM loads WHERE dataset=? AND version_label=? "
+              "AND status='ok' ORDER BY id DESC LIMIT 1",
+        (dataset, version_label),
+    )
+    return row["content_hash"] if row else None
+
+
+def compute_version_sort(conn: sqlite3.Connection, dataset: str, version_label: str,
+                          started_at: str) -> str:
+    """The sortable key for one (dataset, version_label) -- computed once per label (see module
+    docstring) and reused for every later load of that same label."""
+    period = normalize_period(version_label)
+    if period.ok:
+        return "P" + period.period_sort
+    existing = db.fetchone(
+        conn, "SELECT version_sort FROM loads WHERE dataset=? AND version_label=? ORDER BY id LIMIT 1",
+        (dataset, version_label),
+    )
+    return existing["version_sort"] if existing else "F" + started_at
+
+
+def previous_load_id_for_version(conn: sqlite3.Connection, dataset: str,
+                                  version_sort: str) -> int | None:
+    """The diff baseline for a new load: the latest existing ok load of the SAME version_sort
+    (a re-issue/correction of the same label) if one exists, else the latest ok load of the
+    next-LOWER version_sort (a brand new, higher vintage vs. the one just before it). Neither
+    exists (first-ever load, or a vintage inserted out of order before any existing one) -> no
+    baseline. Without version_column every load shares version_sort='' -- this degenerates to
+    "the dataset's own previous load", exactly today's behavior."""
+    same = db.fetchone(
+        conn, "SELECT id FROM loads WHERE dataset=? AND version_sort=? AND status='ok' "
+              "ORDER BY id DESC LIMIT 1",
+        (dataset, version_sort),
+    )
+    if same is not None:
+        return int(same["id"])
+    lower = db.fetchone(
+        conn, "SELECT id FROM loads WHERE dataset=? AND version_sort<? AND status='ok' "
+              "ORDER BY version_sort DESC, id DESC LIMIT 1",
+        (dataset, version_sort),
+    )
+    return int(lower["id"]) if lower else None
+
+
+def list_version_labels(conn: sqlite3.Connection, dataset: str) -> list[str]:
+    """Distinct non-empty version labels for a dataset, oldest to newest (version_sort order).
+    Empty for a dataset that never used `version_column`."""
+    rows = db.fetchall(
+        conn, "SELECT DISTINCT version_label, version_sort FROM loads "
+              "WHERE dataset=? AND status='ok' AND version_label != '' ORDER BY version_sort",
+        (dataset,),
+    )
+    return [r["version_label"] for r in rows]
 
 
 def value_map(rows: list[dict]) -> tuple[dict[tuple, float], int]:
@@ -113,34 +185,40 @@ def upsert_dataset(conn: sqlite3.Connection, name: str, title: str | None, updat
 
 
 def write_skip(conn: sqlite3.Connection, *, dataset: str, content_hash_value: str,
-               started_at: str, finished_at: str) -> int:
+               started_at: str, finished_at: str, version_label: str = "",
+               version_sort: str = "") -> int:
     with db.WRITE_LOCK:
         load_id = db.insert(
             conn, "loads", dataset=dataset, content_hash=content_hash_value, rows=0,
             status="skipped_duplicate", error=None, started_at=started_at, finished_at=finished_at,
+            version_label=version_label, version_sort=version_sort,
         )
         conn.commit()
     return load_id
 
 
 def write_error(conn: sqlite3.Connection, *, dataset: str, error: str,
-                 started_at: str, finished_at: str) -> int:
+                 started_at: str, finished_at: str, version_label: str = "",
+                 version_sort: str = "") -> int:
     with db.WRITE_LOCK:
         load_id = db.insert(
             conn, "loads", dataset=dataset, content_hash="", rows=0, status="error",
             error=error[:2000], started_at=started_at, finished_at=finished_at,
+            version_label=version_label, version_sort=version_sort,
         )
         conn.commit()
     return load_id
 
 
 def write_load(conn: sqlite3.Connection, *, dataset: str, content_hash_value: str,
-               observations: list[dict], report: dict, started_at: str, finished_at: str) -> int:
+               observations: list[dict], report: dict, started_at: str, finished_at: str,
+               version_label: str = "", version_sort: str = "") -> int:
     with db.WRITE_LOCK:
         load_id = db.insert(
             conn, "loads", dataset=dataset, content_hash=content_hash_value,
             rows=len(observations), status="ok", error=None,
             started_at=started_at, finished_at=finished_at,
+            version_label=version_label, version_sort=version_sort,
         )
         if observations:
             conn.executemany(
@@ -179,9 +257,30 @@ def catalog(conn: sqlite3.Connection) -> list[dict]:
             "units": sorted({r["unit"] for r in rows if r["unit"]}),
             "period_from": period_rows[0]["period"] if period_rows else None,
             "period_to": period_rows[-1]["period"] if period_rows else None,
+            "version_labels": list_version_labels(conn, ds["name"]),
             "last_load": dict(last_load) if last_load else None,
         })
     return out
+
+
+def _resolve_version_load_id(conn: sqlite3.Connection, dataset: str, version: str) -> int:
+    """`version` here is neither "latest" nor "all" -- either a load id (existing behavior) or
+    a version_label (its latest ok load)."""
+    try:
+        load_id = int(version)
+    except ValueError:
+        row = db.fetchone(
+            conn, "SELECT id FROM loads WHERE dataset=? AND version_label=? AND status='ok' "
+                  "ORDER BY id DESC LIMIT 1",
+            (dataset, version),
+        )
+        if row is None:
+            raise ValueError(f"해당 dataset의 버전을 찾을 수 없습니다: {version!r}") from None
+        return int(row["id"])
+    row = db.fetchone(conn, "SELECT id FROM loads WHERE id=? AND dataset=?", (load_id, dataset))
+    if row is None:
+        raise ValueError(f"해당 dataset의 load를 찾을 수 없습니다: {version}")
+    return load_id
 
 
 def query_observations(conn: sqlite3.Connection, *, dataset: str, metrics: list[str] | None = None,
@@ -193,19 +292,13 @@ def query_observations(conn: sqlite3.Connection, *, dataset: str, metrics: list[
     elif version == "all":
         table = "observations"
     else:
-        try:
-            load_id = int(version)
-        except ValueError as exc:
-            raise ValueError(f"잘못된 version 값입니다: {version!r}") from exc
-        row = db.fetchone(conn, "SELECT id FROM loads WHERE id=? AND dataset=?", (load_id, dataset))
-        if row is None:
-            raise ValueError(f"해당 dataset의 load를 찾을 수 없습니다: {version}")
+        load_id = _resolve_version_load_id(conn, dataset, version)
         table = "observations"
 
     clauses, params = ["dataset=?"], [dataset]
     if version not in ("latest", "all"):
         clauses.append("load_id=?")
-        params.append(int(version))
+        params.append(load_id)
 
     def _in_clause(col: str, values: list[str] | None) -> None:
         if values:
@@ -234,16 +327,34 @@ def query_observations(conn: sqlite3.Connection, *, dataset: str, metrics: list[
 
 def history(conn: sqlite3.Connection, *, dataset: str, metric: str, entity: str,
             period: str, source: str | None = None) -> list[dict]:
+    """One point per load, oldest to newest -- UNLESS this dataset uses `version_column`
+    (any ok load has a non-empty version_label), in which case one point per version_label
+    (that label's latest ok load), ordered by version_sort. A dataset that never used
+    version_column always takes the first branch -- exactly today's behavior."""
+    has_versions = db.fetchone(
+        conn, "SELECT 1 FROM loads WHERE dataset=? AND status='ok' AND version_label != '' LIMIT 1",
+        (dataset,),
+    ) is not None
+
     clauses = ["l.dataset=?", "o.metric=?", "o.entity=?", "o.period=?", "l.status='ok'"]
     params: list[Any] = [dataset, metric, entity, period]
     if source is not None:
         clauses.append("o.source=?")
         params.append(source)
-    sql = (
-        "SELECT l.id AS load_id, l.started_at, l.finished_at, o.value, o.unit, o.region, o.source "
-        "FROM observations o JOIN loads l ON o.load_id=l.id "
-        "WHERE " + " AND ".join(clauses) + " ORDER BY l.id"
-    )
+    where = " AND ".join(clauses)
+    select = ("l.version_label, l.id AS load_id, l.started_at, l.finished_at, "
+              "o.value, o.unit, o.region, o.source")
+
+    if has_versions:
+        sql = (
+            f"SELECT {select} FROM observations o JOIN loads l ON o.load_id=l.id "
+            f"WHERE {where} AND l.id = ("
+            "  SELECT MAX(l2.id) FROM loads l2 WHERE l2.dataset=l.dataset "
+            "  AND l2.version_label=l.version_label AND l2.status='ok'"
+            ") ORDER BY l.version_sort, l.id"
+        )
+    else:
+        sql = f"SELECT {select} FROM observations o JOIN loads l ON o.load_id=l.id WHERE {where} ORDER BY l.id"
     return [dict(r) for r in db.fetchall(conn, sql, params)]
 
 

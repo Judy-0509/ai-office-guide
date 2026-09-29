@@ -63,3 +63,24 @@ def test_unsafe_view_name_raises(tmp_path):
     p.write_text("db: data.sqlite\nview: 'v_obs; DROP TABLE x'\n", encoding="utf-8")
     with pytest.raises(ValueError):
         load_source(p)
+
+
+def test_version_column_defaults_to_none(tmp_path):
+    p = tmp_path / "source.yaml"
+    p.write_text("db: data.sqlite\nview: v_obs\n", encoding="utf-8")
+    cfg = load_source(p)
+    assert cfg.version_column is None
+
+
+def test_version_column_parsed(tmp_path):
+    p = tmp_path / "source.yaml"
+    p.write_text("db: data.sqlite\nview: v_obs\nversion_column: vintage\n", encoding="utf-8")
+    cfg = load_source(p)
+    assert cfg.version_column == "vintage"
+
+
+def test_version_column_empty_string_raises(tmp_path):
+    p = tmp_path / "source.yaml"
+    p.write_text("db: data.sqlite\nview: v_obs\nversion_column: ''\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="version_column"):
+        load_source(p)

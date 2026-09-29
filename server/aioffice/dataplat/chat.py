@@ -36,7 +36,8 @@ SPEC_SCHEMA: dict[str, Any] = {
         "regions": {"type": "array", "items": {"type": "string"}},
         "sources": {"type": "array", "items": {"type": "string"}},
         "period_from": {}, "period_to": {},
-        "version": {"type": "string", "enum": ["latest", "history"]},
+        "version": {},  # "latest" | "history" | a version_label (e.g. "2026-08") -- polymorphic,
+                        # checked by hand like "clarify" since labels are dataset-specific
         "rows": {"type": "array", "items": {"type": "string"}},
         "cols": {"type": "array", "items": {"type": "string"}},
         "chart": {"type": "string", "enum": ["line", "bar", "stacked", "table"]},
@@ -45,18 +46,22 @@ SPEC_SCHEMA: dict[str, Any] = {
 }
 
 SPEC_SYSTEM_PROMPT = """당신은 사내 데이터 대시보드의 질의 도우미입니다. 사용자의 한국어 질문을
-아래 카탈로그(데이터셋/지표/대상/지역/기관/기간)에 있는 이름만 사용해 하나의 JSON 조회 명세로
+아래 카탈로그(데이터셋/지표/대상/지역/기관/기간/버전)에 있는 이름만 사용해 하나의 JSON 조회 명세로
 바꾸세요. 절대 숫자나 계산 결과를 직접 만들지 마세요 -- 오직 무엇을 조회할지만 결정합니다.
 질문이 모호해서 데이터셋/지표/대상을 하나로 정할 수 없으면 "clarify"에 한국어로 되물을 질문을
 쓰고 나머지 필드는 최선으로 채우세요. 특정 시점 하나의 값을 묻는 질문이면 rows/cols를 비우고
-"chart":"table"을 쓰세요. 값의 버전 변화(수정 이력)를 묻는 질문이면 "version":"history"를
-쓰세요. JSON 객체 하나만 답하세요 -- 설명이나 코드블록 없이.
+"chart":"table"을 쓰세요. 값의 변화 이력을 묻는 질문이면 "version":"history"를 쓰세요.
+
+일부 데이터셋은 "버전"(예측 시점, 예: "2026-07", "2026-08")이 여러 개 있습니다(카탈로그의
+"버전" 목록 참고). "7월 버전", "최신 버전" 등 특정 버전을 콕 집어 물으면 "version"에 그
+버전 이름을 그대로 쓰세요(예: "version":"2026-08"). 버전을 언급하지 않았거나 최신을 원하면
+"version":"latest"를 쓰세요(버전이 없는 데이터셋에는 이 필드가 아무 영향도 없습니다).
 
 JSON 스키마:
 {"dataset": "카탈로그의 데이터셋 이름", "metrics": ["..."], "entities": ["..."], "regions": ["..."],
  "sources": ["..."], "period_from": "YYYY..|null", "period_to": "YYYY..|null",
- "version": "latest|history", "rows": ["entity"등 표의 행 축], "cols": ["period"등 표의 열 축],
- "chart": "line|bar|stacked|table", "clarify": "되물을 질문|null"}
+ "version": "latest|history|<버전 이름>", "rows": ["entity"등 표의 행 축],
+ "cols": ["period"등 표의 열 축], "chart": "line|bar|stacked|table", "clarify": "되물을 질문|null"}
 """
 
 EXPLAIN_SCHEMA: dict[str, Any] = {
@@ -119,7 +124,8 @@ def narrow_catalog(conn: Connection, message: str, history: list[dict]) -> dict:
                 else _top_candidates(query_text, all_entities, MAX_ENTITIES))
 
     return {
-        "datasets": [{"name": d["name"], "title": d["title"]} for d in datasets],
+        "datasets": [{"name": d["name"], "title": d["title"], "versions": d["version_labels"]}
+                     for d in datasets],
         "metrics": sorted(metrics), "entities": sorted(entities),
         "regions": sorted({r for d in datasets for r in d["regions"]}),
         "sources": sorted({s for d in datasets for s in d["sources"]}),
@@ -289,11 +295,11 @@ def _chart_from_wide(table: dict, chart_type: str, row_dims_count: int) -> dict 
     return {"type": chart_type, "x": x, "series": series, "unit": ""}
 
 
-def _chart_from_history(rows: list[dict], label: str) -> dict | None:
+def _chart_from_history(rows: list[dict], series_name: str, x_labels: list[str]) -> dict | None:
     if not rows:
         return None
-    return {"type": "line", "x": [r["finished_at"] or r["started_at"] for r in rows],
-            "series": [{"name": label, "values": [r["value"] for r in rows]}], "unit": ""}
+    return {"type": "line", "x": x_labels,
+            "series": [{"name": series_name, "values": [r["value"] for r in rows]}], "unit": ""}
 
 
 # --- top-level entry point -----------------------------------------------------------------------
@@ -336,24 +342,41 @@ def answer(ctx: ChatContext, message: str, history: list[dict] | None = None) ->
         return _clarify(" / ".join(questions[:3]), spec, started)
     drop_warnings = entity_drop + region_drop + source_drop
 
-    if spec.get("version") == "history":
+    raw_version = spec.get("version")
+    if raw_version in (None, "", "latest", "history"):
+        query_version = raw_version or "latest"
+    else:
+        match, score = _resolve_one(str(raw_version), ds["version_labels"])
+        if match is None or (match != raw_version and score < AUTOCORRECT_THRESHOLD):
+            options = ", ".join(ds["version_labels"]) or "(없음)"
+            return _clarify(f"어떤 버전을 말씀하신 건가요? 후보: {options}", spec, started)
+        query_version = match
+
+    if query_version == "history":
         if not metrics or not entities:
             return _clarify("이력을 보려면 지표와 대상을 하나씩 알려주세요.", spec, started)
         period = spec.get("period_to") or spec.get("period_from") or ""
         if not period:
             return _clarify("이력을 보려면 조회할 기간(period)을 알려주세요.", spec, started)
+        # history() only tracks ONE series (no cross-entity ranking/diff query exists yet) --
+        # if the model asked for several entities, say so instead of silently answering for
+        # just the first one (e.g. "which model changed the most" can't be answered this way).
+        if len(entities) > 1:
+            drop_warnings.append(
+                f"여러 대상 중 '{entities[0]}'의 이력만 보여드립니다 (한 번에 하나의 대상만 가능)")
         rows = store.history(ctx.conn, dataset=ds_match, metric=metrics[0], entity=entities[0],
                               period=period, source=sources[0] if sources else None)
-        table = {"columns": ["load_id", "loaded_at", "value"],
-                 "rows": [[r["load_id"], r["finished_at"] or r["started_at"], r["value"]] for r in rows]}
-        chart = _chart_from_history(rows, f"{metrics[0]}/{entities[0]}")
+        labels = [r.get("version_label") or (r["finished_at"] or r["started_at"]) for r in rows]
+        table = {"columns": ["load_id", "label", "value"],
+                 "rows": [[r["load_id"], lbl, r["value"]] for r, lbl in zip(rows, labels)]}
+        chart = _chart_from_history(rows, f"{metrics[0]}/{entities[0]}", labels)
         value_cols = [2]  # only "value" -- "load_id" is an id, not a data value
     else:
         long_rows = store.query_observations(
             ctx.conn, dataset=ds_match, metrics=metrics or None, entities=entities or None,
             regions=regions or None, sources=sources or None,
             period_from=spec.get("period_from") or None, period_to=spec.get("period_to") or None,
-            version="latest",
+            version=query_version,
         )
         if len(long_rows) > store.QUERY_ROW_CAP:
             return _clarify("조건에 맞는 데이터가 너무 많습니다. 질문을 더 구체적으로 해주세요.", spec, started)

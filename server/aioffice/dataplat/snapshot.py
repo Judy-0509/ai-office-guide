@@ -33,9 +33,10 @@ def _renamed_columns(cursor_description, rename: dict[str, str]) -> list[str]:
 
 
 def read_source_rows(source: SourceConfig) -> list[dict[str, Any]]:
-    """Runs `source.query`, applies `rename`, and checks the required standard columns are
-    present. Values/periods are NOT normalized here (see `normalize_rows`) -- this is just the
-    raw read, kept separate so tests can feed rows straight in."""
+    """Runs `source.query`, applies `rename`, and checks the required standard columns (and
+    `version_column`, if configured) are present. Values/periods are NOT normalized here (see
+    `normalize_rows`) -- this is just the raw read, kept separate so tests can feed rows
+    straight in."""
     conn = open_source_readonly(source.db)
     try:
         cur = conn.execute(source.query)
@@ -43,6 +44,9 @@ def read_source_rows(source: SourceConfig) -> list[dict[str, Any]]:
         missing = [c for c in REQUIRED_COLUMNS if c not in columns]
         if missing:
             raise ValueError(f"쿼리 결과에 필수 컬럼이 없습니다: {missing} (실제: {columns})")
+        if source.version_column and source.version_column not in columns:
+            raise ValueError(
+                f"version_column({source.version_column!r})이 쿼리 결과에 없습니다 (실제: {columns})")
         return [dict(zip(columns, row)) for row in cur.fetchall()]
     finally:
         conn.close()
@@ -63,17 +67,24 @@ class NormalizeStats:
         }
 
 
+VersionKey = tuple[str, str]  # (dataset, version_label) -- version_label is '' when unused
+
+
 def normalize_rows(
-    raw_rows: list[dict[str, Any]],
-) -> tuple[dict[str, list[dict]], dict[str, NormalizeStats]]:
-    """Raw source rows -> {dataset: [observation, ...]}, {dataset: NormalizeStats}. Dropped
-    (blank/non-numeric) rows still count against their dataset's stats even though they never
-    become an observation."""
-    stats_by_dataset: dict[str, NormalizeStats] = {}
-    by_dataset: dict[str, list[dict]] = {}
+    raw_rows: list[dict[str, Any]], version_column: str | None = None,
+) -> tuple[dict[VersionKey, list[dict]], dict[VersionKey, NormalizeStats]]:
+    """Raw source rows -> {(dataset, version_label): [observation, ...]}, {key: NormalizeStats}.
+    `version_label` is '' for every row when `version_column` is None -- the whole versioning
+    scheme then collapses to one implicit version per dataset, exactly today's behavior. Dropped
+    (blank/non-numeric) rows still count against their key's stats even though they never become
+    an observation."""
+    stats_by_key: dict[VersionKey, NormalizeStats] = {}
+    by_key: dict[VersionKey, list[dict]] = {}
     for raw in raw_rows:
         dataset = clean_text(raw.get("dataset"))
-        stats = stats_by_dataset.setdefault(dataset, NormalizeStats())
+        version_label = clean_text(raw.get(version_column)) if version_column else ""
+        key = (dataset, version_label)
+        stats = stats_by_key.setdefault(key, NormalizeStats())
         stats.rows += 1
         value_res = normalize_value(raw.get("value"))
         if value_res.status == "blank":
@@ -88,30 +99,39 @@ def normalize_rows(
         unit = clean_text(raw.get("unit"))
         if value_res.unit == "%":
             unit = "%"
-        by_dataset.setdefault(dataset, []).append({
+        by_key.setdefault(key, []).append({
             "metric": clean_text(raw.get("metric")), "entity": clean_text(raw.get("entity")),
             "region": clean_text(raw.get("region")), "period": period_res.period,
             "period_sort": period_res.period_sort, "source": clean_text(raw.get("source")),
             "value": value_res.value, "unit": unit,
         })
-    return by_dataset, stats_by_dataset
+    return by_key, stats_by_key
 
 
-def snapshot_dataset(conn: sqlite3.Connection, dataset: str, observations: list[dict], *,
-                      dataset_stats: dict, started_at: str, dry_run: bool = False) -> dict:
-    """One dataset's worth of the run: decides skip vs write, returns a Korean-friendly result
-    dict for the console summary."""
+def snapshot_version(conn: sqlite3.Connection, dataset: str, version_label: str,
+                      observations: list[dict], *, version_stats: dict, started_at: str,
+                      dry_run: bool = False) -> dict:
+    """One (dataset, version_label)'s worth of the run: decides skip vs write, returns a
+    Korean-friendly result dict for the console summary. `version_label` is '' when the dataset
+    doesn't use `version_column` -- every check below then reduces to "this dataset's own
+    previous snapshot", exactly today's behavior (see store.py's module docstring)."""
     new_hash = store.content_hash(observations)
-    previous_hash = store.latest_content_hash(conn, dataset)
+    previous_hash = store.latest_content_hash_for_version(conn, dataset, version_label)
     finished_at = store.now_iso()
+    version_sort = (store.compute_version_sort(conn, dataset, version_label, started_at)
+                     if version_label else "")
 
     if previous_hash == new_hash:
         if not dry_run:
             store.write_skip(conn, dataset=dataset, content_hash_value=new_hash,
-                              started_at=started_at, finished_at=finished_at)
-        return {"dataset": dataset, "status": "skipped_duplicate", "rows": len(observations)}
+                              started_at=started_at, finished_at=finished_at,
+                              version_label=version_label, version_sort=version_sort)
+        result = {"dataset": dataset, "status": "skipped_duplicate", "rows": len(observations)}
+        if version_label:
+            result["version_label"] = version_label
+        return result
 
-    previous_load_id = store.latest_ok_load_id(conn, dataset)
+    previous_load_id = store.previous_load_id_for_version(conn, dataset, version_sort)
     previous_rows = (store.query_observations(conn, dataset=dataset, version=str(previous_load_id))
                       if previous_load_id is not None else [])
     previous_map, _ = store.value_map(previous_rows)
@@ -119,7 +139,7 @@ def snapshot_dataset(conn: sqlite3.Connection, dataset: str, observations: list[
     diff = store.diff_report(previous_map, current_map) if previous_load_id is not None else None
 
     report = {
-        **dataset_stats,
+        **version_stats,
         "distinct_metrics": len({o["metric"] for o in observations}),
         "distinct_entities": len({o["entity"] for o in observations}),
         "distinct_periods": len({o["period"] for o in observations}),
@@ -128,45 +148,58 @@ def snapshot_dataset(conn: sqlite3.Connection, dataset: str, observations: list[
         "previous_load_id": previous_load_id,
         "diff": diff,
     }
+    if version_label:
+        report["version_label"] = version_label
     if not dry_run:
         store.write_load(conn, dataset=dataset, content_hash_value=new_hash,
                           observations=observations, report=report,
-                          started_at=started_at, finished_at=finished_at)
-    return {"dataset": dataset, "status": "ok", "rows": len(observations), "report": report}
+                          started_at=started_at, finished_at=finished_at,
+                          version_label=version_label, version_sort=version_sort)
+    result = {"dataset": dataset, "status": "ok", "rows": len(observations), "report": report}
+    if version_label:
+        result["version_label"] = version_label
+    return result
 
 
 def run(source: SourceConfig, db_path: Path, *, dataset: str | None = None,
         dry_run: bool = False) -> list[dict]:
-    """Runs one full snapshot. Returns one result dict per dataset (status ok/error/
-    skipped_duplicate). A dataset that raises is reported as status="error" and does not stop
-    the others."""
+    """Runs one full snapshot. Returns one result dict per (dataset, version_label) -- just one
+    per dataset when `source.version_column` is unset (status ok/error/skipped_duplicate). A
+    key that raises is reported as status="error" and does not stop the others."""
     started_at = store.now_iso()
     try:
         raw_rows = read_source_rows(source)
     except Exception as exc:  # noqa: BLE001 -- the whole run failed before any dataset was seen
         return [{"dataset": dataset or "(전체)", "status": "error", "rows": 0, "error": str(exc)}]
 
-    by_dataset, stats_by_dataset = normalize_rows(raw_rows)
-    dataset_names = sorted(set(by_dataset) | set(stats_by_dataset))
+    by_key, stats_by_key = normalize_rows(raw_rows, source.version_column)
+    keys = sorted(set(by_key) | set(stats_by_key))
     if dataset is not None:
-        dataset_names = [d for d in dataset_names if d == dataset]
+        keys = [k for k in keys if k[0] == dataset]
 
     conn = store.connect(db_path)
     try:
         results = []
-        for name in dataset_names:
-            observations = by_dataset.get(name, [])
-            dataset_stats = stats_by_dataset.get(name, NormalizeStats()).as_dict()
+        upserted: set[str] = set()
+        for name, version_label in keys:
+            observations = by_key.get((name, version_label), [])
+            version_stats = stats_by_key.get((name, version_label), NormalizeStats()).as_dict()
             try:
-                store.upsert_dataset(conn, name, name, started_at)
-                result = snapshot_dataset(conn, name, observations, dataset_stats=dataset_stats,
-                                           started_at=started_at, dry_run=dry_run)
-            except Exception as exc:  # noqa: BLE001 -- one bad dataset never stops the run
+                if name not in upserted:
+                    store.upsert_dataset(conn, name, name, started_at)
+                    upserted.add(name)
+                result = snapshot_version(conn, name, version_label, observations,
+                                           version_stats=version_stats, started_at=started_at,
+                                           dry_run=dry_run)
+            except Exception as exc:  # noqa: BLE001 -- one bad key never stops the run
                 finished_at = store.now_iso()
                 if not dry_run:
                     store.write_error(conn, dataset=name, error=str(exc),
-                                       started_at=started_at, finished_at=finished_at)
+                                       started_at=started_at, finished_at=finished_at,
+                                       version_label=version_label)
                 result = {"dataset": name, "status": "error", "rows": 0, "error": str(exc)}
+                if version_label:
+                    result["version_label"] = version_label
             results.append(result)
         return results
     finally:
@@ -204,18 +237,19 @@ def run_refresh_once(source: SourceConfig, db_path: Path, *, pre_command: str | 
 def _print_summary(results: list[dict]) -> int:
     exit_code = 0
     for r in results:
+        label = f"[{r['version_label']}] " if r.get("version_label") else ""
         if r["status"] == "ok":
             diff = (r.get("report") or {}).get("diff")
             diff_text = ""
             if diff:
                 diff_text = (f" (추가 {diff['added_count']}, 삭제 {diff['removed_count']}, "
                               f"변경 {diff['changed_count']})")
-            print(f"[OK] {r['dataset']}: {r['rows']}행 적재{diff_text}", flush=True)
+            print(f"[OK] {r['dataset']} {label}: {r['rows']}행 적재{diff_text}", flush=True)
         elif r["status"] == "skipped_duplicate":
-            print(f"[건너뜀] {r['dataset']}: 이전 스냅샷과 동일", flush=True)
+            print(f"[건너뜀] {r['dataset']} {label}: 이전 스냅샷과 동일", flush=True)
         else:
             exit_code = 1
-            print(f"[오류] {r['dataset']}: {r.get('error')}", flush=True)
+            print(f"[오류] {r['dataset']} {label}: {r.get('error')}", flush=True)
     return exit_code
 
 

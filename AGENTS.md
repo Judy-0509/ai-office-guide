@@ -20,8 +20,12 @@
    (`dataset, metric, entity, region, period, source, value, unit`)과 어떻게 다른지 확인한다
 2. `v_dataplat_observations` 같은 뷰를 작성하거나 기존 뷰에 `UNION ALL`로 덧붙인다 —
    `03-dataplat-manual.md` 2절의 세 패턴(컬럼명만 맞추기 / 여러 테이블 UNION / wide→long)을
-   그대로 따라 한다. **팀의 원본 테이블에는 아무것도 쓰지 않는다** — `CREATE VIEW`만 한다
-3. `source.yaml`을 새로 쓰거나 갱신한다(`db`, `view` 또는 `query`, 필요하면 `rename`)
+   그대로 따라 한다. **팀의 원본 테이블에는 아무것도 쓰지 않는다** — `CREATE VIEW`만 한다.
+   표 하나에 예측 시점(버전/vintage)이 여러 개 섞여 있으면 **반드시** `version_column`을
+   써야 한다(`03-dataplat-manual.md` 3절) — 없이 그대로 쓰면 서로 다른 시점 값이 조용히
+   합쳐진다
+3. `source.yaml`을 새로 쓰거나 갱신한다(`db`, `view` 또는 `query`, 필요하면 `rename`, 여러
+   버전이 섞인 표면 `version_column`)
 4. 반드시 먼저 `--dry-run`으로 점검한다:
    `python -m aioffice.dataplat.snapshot --source source.yaml --db dataplat.sqlite --dry-run`
    - 적재될 행 수가 원본과 크게 다르면(사람에게 예상 행 수를 먼저 물어봐도 된다) 뷰를 다시 본다

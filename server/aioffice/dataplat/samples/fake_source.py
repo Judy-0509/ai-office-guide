@@ -79,3 +79,51 @@ def build(path: Path, state: str = "v1") -> Path:
     finally:
         conn.close()
     return path
+
+
+# --- a table holding two forecast vintages at once (source.yaml's version_column) --------------
+
+_FORECAST_2026_07 = [
+    # metric, entity, period, value, vintage -- all three entities' 07 forecast
+    ("출하량전망", "모델A", "2026Q3", 100.0, "2026-07"),
+    ("출하량전망", "모델B", "2026Q3", 200.0, "2026-07"),
+    ("출하량전망", "모델C", "2026Q3", 150.0, "2026-07"),
+]
+_FORECAST_2026_08 = [
+    # 08 vintage: A unchanged, B +25% (largest relative change), C -20%
+    ("출하량전망", "모델A", "2026Q3", 100.0, "2026-08"),
+    ("출하량전망", "모델B", "2026Q3", 250.0, "2026-08"),
+    ("출하량전망", "모델C", "2026Q3", 120.0, "2026-08"),
+]
+
+_VERSIONED_VIEW_SQL = """
+CREATE VIEW v_dataplat_versioned AS
+SELECT 'forecast' AS dataset, metric, entity, '' AS region, period, '' AS source, value,
+       '대' AS unit, vintage
+FROM tbl_forecast
+"""
+
+
+def build_versioned(path: Path, state: str = "v1") -> Path:
+    """A `forecast` dataset table carrying one or two forecast vintages in its `vintage`
+    column. `state="v1"`: only the 2026-07 vintage (as if 08 hasn't arrived yet). `state="v2"`:
+    both 2026-07 AND 2026-08 rows present together (08 appended alongside 07, exactly how a real
+    vintage-carrying table grows) -- the scenario `version_column` exists for."""
+    path = Path(path)
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            "CREATE TABLE tbl_forecast (metric TEXT, entity TEXT, period TEXT, value REAL, "
+            "vintage TEXT);"
+        )
+        rows = list(_FORECAST_2026_07)
+        if state == "v2":
+            rows += _FORECAST_2026_08
+        conn.executemany("INSERT INTO tbl_forecast VALUES (?,?,?,?,?)", rows)
+        conn.executescript(_VERSIONED_VIEW_SQL)
+        conn.commit()
+    finally:
+        conn.close()
+    return path

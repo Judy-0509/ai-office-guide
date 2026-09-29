@@ -2,6 +2,7 @@
 grouping by dataset, dedup by content hash, per-dataset diff, dry-run, and the CLI."""
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 
@@ -171,3 +172,123 @@ def test_cli_dry_run_exits_zero_and_writes_nothing(source_and_db, tmp_path):
     # codebase does (see store.connect's docstring) -- dry-run's contract is "no loads
     # recorded", not "the file never exists".
     assert store.list_loads(store.connect(db_path)) == []
+
+
+# --- version_column (a table holding several forecast vintages at once) ------------------------
+
+
+@pytest.fixture()
+def versioned_source_and_db(tmp_path):
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v1")
+    source_yaml = tmp_path / "source.yaml"
+    source_yaml.write_text(
+        "db: fake_source_versioned.sqlite\nview: v_dataplat_versioned\nversion_column: vintage\n",
+        encoding="utf-8",
+    )
+    return load_source(source_yaml), tmp_path / "dataplat.sqlite"
+
+
+def test_normalize_rows_without_version_column_groups_by_dataset_only():
+    raw = [{"dataset": "d", "metric": "m", "entity": "A", "region": "", "period": "2024Q1",
+            "source": "", "value": 1.0, "unit": "", "vintage": "2026-07"}]
+    by_key, _stats = snapshot.normalize_rows(raw, version_column=None)
+    assert list(by_key) == [("d", "")]  # vintage column present but ignored -- unused unless asked for
+
+
+def test_normalize_rows_with_version_column_groups_by_dataset_and_label():
+    raw = [
+        {"dataset": "d", "metric": "m", "entity": "A", "region": "", "period": "2024Q1",
+         "source": "", "value": 1.0, "unit": "", "vintage": "2026-07"},
+        {"dataset": "d", "metric": "m", "entity": "A", "region": "", "period": "2024Q1",
+         "source": "", "value": 2.0, "unit": "", "vintage": "2026-08"},
+    ]
+    by_key, _stats = snapshot.normalize_rows(raw, version_column="vintage")
+    assert set(by_key) == {("d", "2026-07"), ("d", "2026-08")}
+
+
+def test_first_ingest_of_a_single_vintage_writes_one_load(versioned_source_and_db):
+    source, db_path = versioned_source_and_db
+    results = snapshot.run(source, db_path)
+    assert len(results) == 1
+    assert results[0]["status"] == "ok" and results[0]["version_label"] == "2026-07"
+    assert results[0]["report"]["previous_load_id"] is None  # nothing to diff against yet
+
+
+def test_second_vintage_appended_diffs_against_first_and_first_is_skipped(tmp_path):
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v1")
+    source_yaml = tmp_path / "source.yaml"
+    source_yaml.write_text(
+        "db: fake_source_versioned.sqlite\nview: v_dataplat_versioned\nversion_column: vintage\n",
+        encoding="utf-8",
+    )
+    source = load_source(source_yaml)
+    db_path = tmp_path / "dataplat.sqlite"
+    snapshot.run(source, db_path)
+
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v2")
+    results = snapshot.run(source, db_path)
+    by_label = {r["version_label"]: r for r in results}
+    assert by_label["2026-07"]["status"] == "skipped_duplicate"
+    assert by_label["2026-08"]["status"] == "ok"
+    diff = by_label["2026-08"]["report"]["diff"]
+    assert diff["changed_count"] == 2  # B and C changed, A stayed the same
+    # 모델B: 200->250 (25% relative change) ranks above 모델C: 150->120 (20%)
+    assert diff["top_changes"][0]["entity"] == "모델B"
+
+
+def test_reissue_of_same_vintage_diffs_against_its_own_previous_content(tmp_path):
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v1")
+    source_yaml = tmp_path / "source.yaml"
+    source_yaml.write_text(
+        "db: fake_source_versioned.sqlite\nview: v_dataplat_versioned\nversion_column: vintage\n",
+        encoding="utf-8",
+    )
+    source = load_source(source_yaml)
+    db_path = tmp_path / "dataplat.sqlite"
+    snapshot.run(source, db_path)
+
+    # correct the 2026-07 vintage in place (still the only vintage in the table)
+    conn = sqlite3.connect(str(tmp_path / "fake_source_versioned.sqlite"))
+    conn.execute("UPDATE tbl_forecast SET value=999 WHERE entity='모델A'")
+    conn.commit()
+    conn.close()
+
+    results = snapshot.run(source, db_path)
+    assert results[0]["status"] == "ok" and results[0]["version_label"] == "2026-07"
+    diff = results[0]["report"]["diff"]
+    assert diff["changed_count"] == 1
+    assert diff["top_changes"][0]["entity"] == "모델A" and diff["top_changes"][0]["new"] == 999.0
+
+
+def test_catalog_and_latest_after_two_vintages(tmp_path):
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v2")
+    source_yaml = tmp_path / "source.yaml"
+    source_yaml.write_text(
+        "db: fake_source_versioned.sqlite\nview: v_dataplat_versioned\nversion_column: vintage\n",
+        encoding="utf-8",
+    )
+    source = load_source(source_yaml)
+    db_path = tmp_path / "dataplat.sqlite"
+    snapshot.run(source, db_path)
+
+    conn = store.connect(db_path)
+    cat = next(d for d in store.catalog(conn) if d["name"] == "forecast")
+    assert cat["version_labels"] == ["2026-07", "2026-08"]
+    latest = store.query_observations(conn, dataset="forecast", version="latest")
+    b = next(r for r in latest if r["entity"] == "모델B")
+    assert b["value"] == 250.0  # the 08 vintage, not 07's 200
+
+
+def test_missing_version_column_in_query_result_raises(tmp_path):
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v1")
+    source_yaml = tmp_path / "source.yaml"
+    source_yaml.write_text(
+        "db: fake_source_versioned.sqlite\n"
+        "query: SELECT dataset, metric, entity, region, period, source, value, unit "
+        "FROM v_dataplat_versioned\n"  # vintage column dropped from the SELECT
+        "version_column: vintage\n",
+        encoding="utf-8",
+    )
+    source = load_source(source_yaml)
+    with pytest.raises(ValueError, match="version_column"):
+        snapshot.read_source_rows(source)

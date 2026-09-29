@@ -76,19 +76,66 @@ SELECT 'price_index' AS dataset, '가격지수' AS metric, entity, region, '2024
 있는 경우 등)는 신경 쓸 필요 없습니다 — 그 파이프라인의 최종 산출 테이블만 보고 뷰를 짜면
 됩니다.
 
-## 3. `source.yaml` 작성
+## 3. 한 표에 버전(vintage)이 여러 개 있을 때 — `version_column`
+
+가끔 팀 원본 테이블 하나에 **예측 시점이 다른 값 여러 개**가 함께 들어 있습니다 — 예를 들어
+"2026-07에 만든 예측"과 "2026-08에 만든 예측"이 표준 8개 컬럼 말고 별도 컬럼(예: `vintage`)에
+표시되어 같은 표 안에 섞여 있는 경우입니다.
+
+**이런 테이블은 `version_column` 없이 절대 그대로 쓰면 안 됩니다.** `version_column`을 지정하지
+않고 이 표를 읽으면 서로 다른 시점의 예측이 `entity`/`period`가 같다는 이유만으로 같은 관측치로
+뒤섞입니다 — 합계를 내거나 최신값을 뽑으면 7월 예측과 8월 예측이 무작위로 섞인, 어느 시점의
+것도 아닌 의미 없는 숫자가 나옵니다(어느 쪽 행이 "이겼는지"도 알 수 없습니다).
+
+뷰가 그 컬럼을 표준 8개 컬럼과 함께 내보내게 하고, `source.yaml`에 `version_column`만
+추가하면 됩니다:
+
+```sql
+CREATE VIEW v_forecast_versions AS
+SELECT 'forecast' AS dataset, metric, entity, region, period, source, value, unit,
+       vintage                      -- 표준 8개 컬럼 + 버전 컬럼
+FROM tbl_forecast;
+```
+
+```yaml
+db: C:/data/team.sqlite
+view: v_forecast_versions
+version_column: vintage            # 뷰가 낸 버전 컬럼 이름 (rename 적용 후 이름 기준)
+```
+
+동작 방식(전체 예시는 `samples/fake_source.py`의 `build_versioned()`, `samples/source_versioned.yaml`
+참고):
+
+- 스냅샷은 `(dataset, 버전값)`별로 따로 버전 관리됩니다. 같은 버전 값이 내용까지 같으면
+  건너뛰고(`skipped_duplicate`), 내용이 바뀌었으면(수정/재발행) 그 버전의 새 적재를 씁니다.
+  다른 버전끼리는 중복 판정에 영향을 주지 않습니다.
+- 버전은 시간순이 아니라 **버전 값 자체**로 정렬됩니다 — `YYYY-MM`/`YYYY`/`YYYYQn` 형식이면
+  자연스럽게 시간순, 그 외 형식이면 처음 등장한 순서를 씁니다.
+- `latest` = 가장 높은 버전의 최신 적재. `GET /api/catalog`가 데이터셋별 버전 목록을 보여주고,
+  `GET /api/query?...&version=2026-08`처럼 특정 버전을 직접 조회할 수 있습니다.
+- 리포트의 diff는 "바로 이전 버전"과 비교합니다(예: 2026-08 적재 시 2026-07과 비교) — 같은
+  버전을 재발행한 경우엔 그 버전의 이전 내용과 비교합니다.
+- `version_column`을 쓰지 않는 데이터셋은 이 절의 내용과 전혀 무관합니다 — 지금까지와 완전히
+  똑같이 동작합니다.
+- 챗봇도 버전을 알아듣습니다: "7월 버전", "지난 버전 대비 바뀐 거 있어?" 같은 질문에서 버전을
+  하나로 특정할 수 없으면(예: "지난 버전 대비 가장 많이 바뀐 모델은?"처럼 특정 항목이 아니라
+  전체를 비교해야 하는 질문) 챗봇이 표에 없는 숫자를 지어내는 대신 되물어보거나, 질문을 더
+  구체적으로 해달라고 안내합니다 — 8절 검증 체크리스트에서 함께 확인하세요.
+
+## 4. `source.yaml` 작성
 
 ```yaml
 db: C:/data/team.sqlite            # 이 파일(source.yaml) 기준 상대경로도 허용
 view: v_dataplat_observations      # 뷰 이름 (또는 query: "SELECT ..." 로 직접 쿼리)
 rename:                            # 뷰가 표준 이름과 다른 컬럼명을 낼 때만 (선택)
   broker: source
+version_column: vintage            # 한 표에 여러 버전(vintage)이 섞여 있을 때만 (선택, 3절)
 ```
 
 `db`/`view`(또는 `query`) 중 하나라도 빠지면, 또는 `query`와 `view`를 동시에 쓰면 바로
 `ValueError`로 실패합니다(잘못된 설정으로 조용히 넘어가지 않음).
 
-## 4. 점검: `snapshot --dry-run`
+## 5. 점검: `snapshot --dry-run`
 
 DB에 쓰지 않고 리포트만 봅니다. 뷰를 새로 짜거나 고칠 때마다 이걸로 먼저 확인하세요:
 
@@ -115,7 +162,7 @@ python -m aioffice.dataplat.snapshot --source source.yaml --db dataplat.sqlite -
 값이 몇 건 비었는지(빈값/숫자 아님/기간 파싱 실패)도 `--dry-run` 리포트에 나오니, 뷰의
 `value`/`period` 표현식이 기대와 다르게 나오는 셀이 있는지 여기서 걸러내세요.
 
-## 5. 서버 시작 (`--site`로 대시보드까지 같이)
+## 6. 서버 시작 (`--site`로 대시보드까지 같이)
 
 ```powershell
 python -m aioffice.dataplat.server --db dataplat.sqlite --source source.yaml ^
@@ -126,7 +173,7 @@ python -m aioffice.dataplat.server --db dataplat.sqlite --source source.yaml ^
 `/chat`으로 참고용 챗 페이지가 같은 origin에서 뜹니다(운영 환경에서 CORS 설정 불필요).
 `127.0.0.1`이 아닌 주소로 열려면 `--admin-token`이 필수입니다(없으면 시작 자체를 거부합니다).
 
-## 6. 대시보드의 데이터 로딩을 API로 바꾸기
+## 7. 대시보드의 데이터 로딩을 API로 바꾸기
 
 `server/aioffice/dataplat/clients/dataplat-client.ts`를 대시보드 프로젝트에 복사합니다(차트
 라이브러리를 지정하지 않은, `fetch`만 쓰는 타입 클라이언트라 팀이 쓰는 어떤 라이브러리와도
@@ -158,7 +205,7 @@ React라면 `useEffect`로 마운트 시 `catalog()`/`queryWide()`를 호출하�
 됩니다(`server/README.md`의 예시 참고). 갱신 버튼은 `refresh()` 호출 후 `refreshStatus()`를
 짧은 간격으로 폴링해 `running`이 꺼지면 데이터를 다시 불러오도록 구현하세요.
 
-## 7. 예약 등록 (팀 기존 집계 명령과 함께)
+## 8. 예약 등록 (팀 기존 집계 명령과 함께)
 
 ```powershell
 python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
@@ -171,7 +218,7 @@ python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
 `dataplat_run.log`(같은 폴더)에 남습니다. `schedule show`로 등록 상태, `schedule remove`로
 삭제합니다.
 
-## 8. 검증 체크리스트
+## 9. 검증 체크리스트
 
 새 데이터셋을 연결했거나 뷰를 크게 고쳤을 때마다:
 
@@ -189,7 +236,14 @@ python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
    | 3 | 기관 비교 | "기관A랑 기관B 출하량 비교해줘" | | | |
    | 4 | 버전 변화 | "지난 스냅샷 대비 뭐가 바뀌었어?" | | | |
    | 5 | 모호한 질문 | "그거 얼마였지?" (되물음 기대) | | | |
-   | 6~10 | (팀 데이터셋에 맞게 반복) | | | | |
+   | 6 | 특정 버전 (version_column 쓰는 데이터셋만) | "모델A 7월 버전 얼마야?" | | | |
+   | 7~10 | (팀 데이터셋에 맞게 반복) | | | | |
+
+   `version_column`을 쓰는 데이터셋이 있다면 "지난 버전 대비 가장 많이 바뀐 모델은?"처럼
+   **특정 항목이 아니라 전체를 비교**해야 하는 질문도 한 번 던져보세요 — 챗봇은 두 버전
+   사이의 전체 비교표를 만드는 기능이 없으므로(3절), 표에 없는 숫자를 지어내지 않고 되묻거나
+   더 구체적인 질문을 유도하는 것이 **정답**입니다(단정적으로 틀린 모델명을 답하면 실패로
+   기록).
 
    "정답" 판정은 `table`에 나온 숫자를 1번 항목처럼 원본과 대조해서 내립니다. 모호한 질문에서
    되물음 없이 틀린 값을 확신에 차서 답하면 실패로 기록하세요(챗봇은 표에 없는 숫자를 답하지
@@ -206,7 +260,7 @@ python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
 4. **`--admin-token` 없이 갱신이 막히는지**: `POST /api/refresh`를 토큰 없이 호출해 401이
    나오는지 한 번은 확인하세요(운영 배포 전 1회면 충분).
 
-## 9. 문제 해결
+## 10. 문제 해결
 
 | 증상 | 확인할 것 |
 |---|---|
@@ -215,3 +269,5 @@ python -m aioffice.dataplat.schedule install --day MON --time 08:00 ^
 | API가 401 | `--admin-token` 설정 여부와 `Authorization: Bearer <token>` 헤더 확인(읽기 엔드포인트는 토큰이 필요 없음 — `/api/refresh`만) |
 | 서버가 비loopback 주소로 시작을 거부 | `--host`가 `127.0.0.1`/`localhost`가 아니면 `--admin-token`이 필수입니다 |
 | 챗봇이 계속 되물음만 함 | 질문에 **직접 쓴** 이름(데이터셋/지표, 또는 메시지에 등장한 대상명)이 카탈로그(`GET /api/catalog`)에 있는 이름과 너무 다른지 확인 — 유사도 0.85 미만이면 자동 교정 대신 후보를 보여줍니다. 기관/지역, 또는 모델이 스스로 추가한 대상(사용자가 언급하지 않은)이 카탈로그에 없을 때는 되물음 대신 `warnings`에 "존재하지 않는 조건 '...'는 제외했습니다"만 남기고 조회는 계속됩니다 — 이건 정상 동작입니다 |
+| `version_column`을 쓰는 데이터셋의 값이 뒤섞여 보임 | 뷰가 그 컬럼을 실제로 내보내는지(3절), `source.yaml`의 `version_column` 이름이 뷰 출력 컬럼명(rename 적용 후)과 정확히 일치하는지 확인 — 다르면 스냅샷이 바로 `ValueError`로 실패합니다(조용히 섞이지 않음) |
+| 특정 버전이 안 보임/최신이 예상과 다름 | `GET /api/catalog`의 `version_labels`로 실제 저장된 버전 목록을 확인. `YYYY-MM` 형식이 아닌 버전 이름(예: "draft")은 시간순이 아니라 처음 적재된 순서로 정렬됩니다(3절) |

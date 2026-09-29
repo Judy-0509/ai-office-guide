@@ -208,3 +208,104 @@ def test_no_rows_returns_no_data_message_without_llm_explain_call(ctx):
     result = chat.answer(ctx_obj, "2099년 출하량")
     assert result["table"]["rows"] == []
     assert len(backend.calls) == 1  # explain skipped: nothing to explain
+
+
+# --- version_column (spec "version": a version_label) -------------------------------------------
+
+
+@pytest.fixture()
+def versioned_ctx(tmp_path):
+    settings = Settings.load(None, environ={"DATA_DIR": str(tmp_path / "data")})
+    conn = store.connect(tmp_path / "dataplat.sqlite")
+    store.upsert_dataset(conn, "forecast", "출하 전망", store.now_iso())
+    rows_07 = [{"metric": "출하량전망", "entity": "모델A", "region": "", "period": "2026Q3",
+                "period_sort": "20260700", "source": "", "value": 100.0, "unit": ""},
+               {"metric": "출하량전망", "entity": "모델B", "region": "", "period": "2026Q3",
+                "period_sort": "20260700", "source": "", "value": 200.0, "unit": ""}]
+    rows_08 = [{"metric": "출하량전망", "entity": "모델A", "region": "", "period": "2026Q3",
+                "period_sort": "20260700", "source": "", "value": 120.0, "unit": ""},
+               {"metric": "출하량전망", "entity": "모델B", "region": "", "period": "2026Q3",
+                "period_sort": "20260700", "source": "", "value": 250.0, "unit": ""}]
+    vs07 = store.compute_version_sort(conn, "forecast", "2026-07", store.now_iso())
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows_07),
+                      observations=rows_07, report={}, started_at=store.now_iso(),
+                      finished_at=store.now_iso(), version_label="2026-07", version_sort=vs07)
+    vs08 = store.compute_version_sort(conn, "forecast", "2026-08", store.now_iso())
+    store.write_load(conn, dataset="forecast", content_hash_value=store.content_hash(rows_08),
+                      observations=rows_08, report={}, started_at=store.now_iso(),
+                      finished_at=store.now_iso(), version_label="2026-08", version_sort=vs08)
+
+    def make(responses):
+        backend = FakeContentBackend(responses)
+        llm = LLMClient(settings, conn, backend=backend)
+        return chat.ChatContext(conn=conn, llm=llm), backend
+
+    return make
+
+
+def test_spec_version_label_resolves_to_that_versions_data(versioned_ctx):
+    ctx_obj, _backend = versioned_ctx([
+        {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"],
+         "version": "2026-07", "clarify": None},
+        {"sentence": "모델A 출하량전망은 100입니다."},
+    ])
+    result = chat.answer(ctx_obj, "모델A 7월 버전 출하량전망 보여줘")
+    assert result["table"]["rows"] == [["모델A", 100.0]]
+
+
+def test_spec_version_defaults_to_latest_when_omitted(versioned_ctx):
+    ctx_obj, _backend = versioned_ctx([
+        {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"], "clarify": None},
+        {"sentence": "모델A 출하량전망은 120입니다."},
+    ])
+    result = chat.answer(ctx_obj, "모델A 출하량전망 보여줘")
+    assert result["table"]["rows"] == [["모델A", 120.0]]
+
+
+def test_spec_unknown_version_label_clarifies_with_candidates(versioned_ctx):
+    ctx_obj, backend = versioned_ctx([
+        {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"],
+         "version": "2099-01", "clarify": None},
+    ])
+    result = chat.answer(ctx_obj, "모델A 2099년 버전 출하량전망")
+    assert result["warnings"] == ["clarify"]
+    assert "2026-07" in result["answer"] and "2026-08" in result["answer"]
+    assert len(backend.calls) == 1  # explain never ran
+
+
+def test_spec_version_label_auto_corrects_near_miss(versioned_ctx):
+    ctx_obj, _backend = versioned_ctx([
+        {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"],
+         "version": "2026-07 ", "clarify": None},  # trailing space -- not an exact match
+        {"sentence": "요약입니다."},
+    ])
+    result = chat.answer(ctx_obj, "모델A 7월 버전 출하량전망")
+    assert result["warnings"] != ["clarify"]
+    assert result["table"]["rows"] == [["모델A", 100.0]]
+
+
+def test_spec_version_history_shows_one_point_per_label(versioned_ctx):
+    ctx_obj, backend = versioned_ctx([
+        {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A"],
+         "version": "history", "period_to": "2026Q3", "clarify": None},
+        {"sentence": "모델A 출하량전망은 100에서 120으로 늘었습니다."},
+    ])
+    result = chat.answer(ctx_obj, "모델A 출하량전망 버전별로 어떻게 바뀌었어?")
+    assert result["table"]["columns"] == ["load_id", "label", "value"]
+    assert [r[1] for r in result["table"]["rows"]] == ["2026-07", "2026-08"]
+    assert [r[2] for r in result["table"]["rows"]] == [100.0, 120.0]
+
+
+def test_spec_version_history_with_multiple_entities_warns_and_uses_first(versioned_ctx):
+    # history() tracks one series -- no cross-entity ranking/diff query exists yet ("which
+    # model changed the most" can't be answered this way). Asking for several entities must
+    # warn and fall back to the first, never silently answer for only one of them.
+    ctx_obj, backend = versioned_ctx([
+        {"dataset": "forecast", "metrics": ["출하량전망"], "entities": ["모델A", "모델B"],
+         "version": "history", "period_to": "2026Q3", "clarify": None},
+        {"sentence": "모델A 출하량전망은 100에서 120으로 늘었습니다."},
+    ])
+    result = chat.answer(ctx_obj, "지난 버전 대비 가장 많이 바뀐 모델은?")
+    assert any("모델A" in w and "하나의 대상만" in w for w in result["warnings"])
+    assert [r[1] for r in result["table"]["rows"]] == ["2026-07", "2026-08"]
+    assert [r[2] for r in result["table"]["rows"]] == [100.0, 120.0]  # 모델A only, not 모델B

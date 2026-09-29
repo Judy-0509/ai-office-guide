@@ -255,3 +255,70 @@ def test_chat_page_served(running_server):
     status, body, headers = _get(port, "/chat")
     assert status == 200
     assert "text/html" in headers.get("Content-Type", "")
+
+
+# --- version_column (a dataset with several forecast vintages) ----------------------------------
+
+
+@pytest.fixture()
+def running_versioned_server(tmp_path):
+    fake_source.build_versioned(tmp_path / "fake_source_versioned.sqlite", state="v2")
+    p = tmp_path / "source.yaml"
+    p.write_text("db: fake_source_versioned.sqlite\nview: v_dataplat_versioned\n"
+                  "version_column: vintage\n", encoding="utf-8")
+    source = load_source(p)
+    db_path = tmp_path / "dataplat.sqlite"
+    snapshot.run(source, db_path)
+    settings = Settings.load(None, environ={"DATA_DIR": str(tmp_path / "data")})
+
+    srv = dpserver.build_server(db_path, source, settings, "127.0.0.1", 0)
+    port = srv.server_address[1]
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        srv.shutdown()
+        thread.join(5)
+        srv.server_close()
+
+
+def test_catalog_lists_version_labels(running_versioned_server):
+    status, body, _ = _get(running_versioned_server, "/api/catalog")
+    assert status == 200
+    forecast = next(d for d in body["datasets"] if d["name"] == "forecast")
+    assert forecast["version_labels"] == ["2026-07", "2026-08"]
+
+
+def test_query_by_version_label(running_versioned_server):
+    status, body, _ = _get(running_versioned_server, "/api/query?dataset=forecast&version=2026-07")
+    assert status == 200
+    b = next(r for r in body["rows"] if r["entity"] == "모델B")
+    assert b["value"] == 200.0
+
+    status2, body2, _ = _get(running_versioned_server, "/api/query?dataset=forecast&version=latest")
+    b2 = next(r for r in body2["rows"] if r["entity"] == "모델B")
+    assert b2["value"] == 250.0
+
+
+def test_query_unknown_version_label_is_400(running_versioned_server):
+    status, body, _ = _get(running_versioned_server, "/api/query?dataset=forecast&version=2099-01")
+    assert status == 400
+
+
+def test_history_one_point_per_version_label(running_versioned_server):
+    status, body, _ = _get(
+        running_versioned_server,
+        "/api/history?dataset=forecast&metric=%EC%B6%9C%ED%95%98%EB%9F%89%EC%A0%84%EB%A7%9D"
+        "&entity=%EB%AA%A8%EB%8D%B8B&period=2026Q3",
+    )
+    assert status == 200
+    labels = [h["version_label"] for h in body["history"]]
+    assert labels == ["2026-07", "2026-08"]
+
+
+def test_loads_show_version_label(running_versioned_server):
+    status, body, _ = _get(running_versioned_server, "/api/loads?dataset=forecast")
+    assert status == 200
+    labels = {l["version_label"] for l in body["loads"]}
+    assert labels == {"2026-07", "2026-08"}
