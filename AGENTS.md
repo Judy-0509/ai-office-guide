@@ -66,6 +66,43 @@
    쿼리는 [`02-analyst-manual.md`](02-analyst-manual.md#7-analystsqlite-표-설명) 참고
 6. vault에 근거가 없으면 지어내지 말고 "vault에 없음"이라고 답한다
 
+## 지식 조회 (MCP) 등록과 사용
+
+vault를 읽는 전용 MCP 서버가 있습니다. 사람 질문에 답할 때는 `reports/*.md`를 직접 여는 대신
+**이 도구들을 먼저 쓰세요** — 같은 함수를 HTTP API(`/api/v1/...`, 자세한 내용은
+[`02-analyst-manual.md`](02-analyst-manual.md#10-지식-조회-apimcp) 10절)도 쓰므로 결과가
+일치합니다.
+
+`opencode.json`에 등록(키 이름은 설치된 OpenCode 버전에 맞게 확인):
+
+```json
+{
+  "mcp": {
+    "ai-analyst": {
+      "type": "local",
+      "command": ["python", "-m", "aioffice.analyst.mcp", "--vault", "<vault 경로>", "--env", "<.env 경로>"],
+      "enabled": true
+    }
+  }
+}
+```
+
+어떤 질문에 어떤 도구:
+
+| 질문 유형 | 도구 |
+|---|---|
+| "지금까지 뭘 알고 있어?", 대화 시작 | `knowledge_overview` |
+| 구체적인 주제 id를 모를 때 | `search_knowledge` (그다음 `get_topic`) |
+| 특정 주제의 현재 판단·근거·과거 이력 | `get_topic` |
+| "이번 주/이번 달 뭐가 바뀌었어?" | `what_changed` |
+| 표/원자료가 필요할 때(기업·지표·증권사·기간 조건) | `find_claims` |
+| "이 숫자가 시간에 따라 어떻게 바뀌었어?" | `metric_history` |
+
+**반드시 지킬 것**: 답변에는 항상 도구가 반환한 `citation.report_path`(또는 `report_path`)를
+`[파일명]` 형태로 인용하세요. 숫자·날짜·판단은 도구 결과에 있는 값만 쓰고 지어내지 마세요.
+vault에 근거가 없으면 "vault에 없음"이라고 답하세요(위 "사람 질문에 답하는 방법" 절과 동일한
+원칙).
+
 ## 하드 규칙
 
 - vault·리포트·`analyst.sqlite`의 어떤 내용도 회사 밖이나 외부 개발자에게 보내지 않는다

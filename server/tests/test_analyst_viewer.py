@@ -10,6 +10,7 @@ import urllib.request
 
 import pytest
 
+from aioffice import db
 from aioffice.analyst import store, viewer
 from aioffice.config import Settings
 
@@ -73,6 +74,14 @@ def _seed_state(vault):
     render.write_report_page(vault, state, report["id"])
     render.write_topic_page(vault, state, "t001")
     render.write_index_and_log(vault, state)
+
+    # also keep the SQL mirror in sync (viewer.build_server only rebuilds it once, at
+    # startup, before this seeding runs) -- a fresh short-lived connection is enough.
+    conn = db.connect(store.db_path(vault))
+    db.init_schema(conn)
+    store.rebuild_mirror_db(state, conn)
+    conn.close()
+
     return report, claim, topic
 
 
@@ -147,6 +156,19 @@ def test_index_serves_placeholder_when_no_viewer_html(analyst_server):
         content_type = r.headers.get("Content-Type")
     assert "text/html" in content_type
     assert "html" in body.lower()
+
+
+def test_api_v1_is_mounted_on_the_viewer_server(analyst_server):
+    """The knowledge HTTP API is reachable at /api/v1/... on the same viewer server, with
+    no extra auth (the viewer already binds 127.0.0.1 by default)."""
+    _srv, port, vault, _inbox = analyst_server
+    _seed_state(vault)
+    status, data = _get(port, "/api/v1/overview")
+    assert status == 200
+    assert data["reports"] == 1
+
+    status, data = _get(port, "/api/v1/topics/t001")
+    assert status == 200 and data["name"] == "주제"
 
 
 def test_status_reports_counts_and_model(analyst_server):

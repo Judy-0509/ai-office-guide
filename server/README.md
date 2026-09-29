@@ -181,13 +181,36 @@ python -m aioffice.analyst.viewer --vault <vault 폴더> --inbox <리포트 폴�
 
 | 테이블 | 설명 |
 |---|---|
-| `reports` | 리포트 1건당 1행: id, path, broker, title, date, date_source, status(`learned`/`rolled_back`), review, fictional |
+| `reports` | 리포트 1건당 1행: id, path, broker, title, date, date_source, status(`learned`/`rolled_back`/`error`), review, fictional |
 | `claims` | 주장 1건당 1행: report_id/report_date/broker, text, type, direction, metric/value/unit/period, quote, number_ok, topic_id, relation, target_claim_id, valid, invalid_at, invalidated_by |
 | `topics` | 주제 1건당 1행: name, 현재 summary/trend, created_report_id, created_date |
 | `topic_summaries` | 주제별 판단 변화 이력(consolidate가 쌓음): topic_id, date, summary, trend |
 | `relations` | 주제 간 관계: src, dst, kind(`causes`/`affects`/`contradicts`/`related`), why, first_seen, last_seen, evidence(JSON 배열) |
 | `feedback` | 주장 교정 이력(few-shot 예시로 재사용): report_id, claim_id, text(원본), corrected_text, corrected_topic_id |
 | `llm_calls` | (`aioffice.db` 공통 스키마) LLM 호출 로그 — 이 미러가 절대 건드리지 않음 |
+
+### 지식 조회 (HTTP API·MCP)
+
+프로그램(사내 대시보드 등)과 AI 코딩 에이전트(OpenCode)가 학습 내용을 조회하는 두 door. 읽기
+전용 함수 6개(`aioffice/analyst/knowledge.py`: `overview`, `search`, `topic`, `changes`,
+`claims`, `metric_history`)를 `<vault>/analyst.sqlite`에서 읽어 그대로 공유한다 — LLM은
+`search`의 순위 매기기에만(임베딩/재랭커 설정 시) 쓰이고 답을 새로 생성하지 않는다.
+
+```powershell
+# 뷰어에 이미 마운트되어 있음 (analyst.run/viewer 실행 시 자동)
+# 독립 실행(읽기 전용):
+python -m aioffice.analyst.api --vault <vault> --env .env --port 8790
+# MCP(stdio):
+python -m aioffice.analyst.mcp --vault <vault> --env .env
+```
+
+`GET /api/v1` 이 엔드포인트 목록을 자기서술형으로 반환한다(`overview`/`search`/`topics`/
+`topics/<id>`/`changes`/`claims`/`metric_history`). 기본은 127.0.0.1이며, loopback이 아닌
+`--host`로 열려면 `--token`이 필수(없으면 시작 거부)이고 모든 요청에
+`Authorization: Bearer <token>` 또는 `X-API-Key`가 필요하다. `--cors <origin>`으로 브라우저
+대시보드 하나만 허용할 수 있다. 대시보드 연동 예시는
+`server/scripts/dashboard_client_example.py`(표준 라이브러리만 사용). 자세한 내용(엔드포인트
+표, 예시 응답, `opencode.json` 등록)은 공개 가이드 `02-analyst-manual.md` 10절 참고.
 
 ## 테스트
 

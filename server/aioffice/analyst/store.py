@@ -585,10 +585,13 @@ CREATE TABLE reports (
 );
 CREATE TABLE claims (
     id TEXT PRIMARY KEY, report_id TEXT, report_date TEXT, broker TEXT, text TEXT,
-    type TEXT, direction TEXT, metric TEXT, value TEXT, unit TEXT, period TEXT,
+    type TEXT, direction TEXT, entities TEXT, metric TEXT, value TEXT, unit TEXT, period TEXT,
     quote TEXT, number_ok INTEGER, topic_id TEXT, relation TEXT, target_claim_id TEXT,
     valid INTEGER, invalid_at TEXT, invalidated_by TEXT
 );
+CREATE INDEX idx_claims_report ON claims(report_id);
+CREATE INDEX idx_claims_topic ON claims(topic_id);
+CREATE INDEX idx_claims_valid ON claims(valid);
 CREATE TABLE topics (
     id TEXT PRIMARY KEY, name TEXT, summary TEXT, trend TEXT,
     created_report_id TEXT, created_date TEXT
@@ -596,9 +599,12 @@ CREATE TABLE topics (
 CREATE TABLE topic_summaries (
     topic_id TEXT, date TEXT, summary TEXT, trend TEXT
 );
+CREATE INDEX idx_topic_summaries_topic ON topic_summaries(topic_id);
 CREATE TABLE relations (
     src TEXT, dst TEXT, kind TEXT, why TEXT, first_seen TEXT, last_seen TEXT, evidence TEXT
 );
+CREATE INDEX idx_relations_src ON relations(src);
+CREATE INDEX idx_relations_dst ON relations(dst);
 CREATE TABLE feedback (
     report_id TEXT, claim_id TEXT, text TEXT, corrected_text TEXT, corrected_topic_id TEXT
 );
@@ -629,10 +635,10 @@ def _rebuild_mirror_db_locked(state: AnalystState, conn: sqlite3.Connection) -> 
             )
         for c in state.claims:
             conn.execute(
-                "INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO claims VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (c["id"], c["report_id"], c["report_date"], c["broker"], c["text"],
-                 c.get("type"), c.get("direction"), c.get("metric"), c.get("value"),
-                 c.get("unit"), c.get("period"), c.get("quote"),
+                 c.get("type"), c.get("direction"), json.dumps(c.get("entities") or [], ensure_ascii=False),
+                 c.get("metric"), c.get("value"), c.get("unit"), c.get("period"), c.get("quote"),
                  int(bool(c.get("number_ok", True))), c.get("topic_id"), c.get("relation"),
                  c.get("target_claim_id"), int(bool(c.get("valid", True))),
                  c.get("invalid_at"), c.get("invalidated_by")),

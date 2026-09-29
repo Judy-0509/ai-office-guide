@@ -290,7 +290,124 @@ git show <커밋>:reports/<파일명>.md
   없음), 리포트당 호출 2회 이상이 순차로 걸리는 것이 정상입니다. 임베딩/재랭커 없이 돌리면
   후보 주제 검색 정확도는 낮아지지만 네트워크 호출이 없어 오히려 더 빠릅니다.
 
-## 10. 외부 반출 규칙
+## 10. 지식 조회 (API·MCP)
+
+학습 내용을 프로그램(사내 대시보드 등)과 AI 코딩 에이전트(OpenCode) 양쪽에서 쓸 수 있도록,
+같은 읽기 전용 함수 6개를 HTTP API와 MCP 두 door로 노출합니다. 둘 다 `<vault>/analyst.sqlite`
+(7절)만 읽고 아무것도 바꾸지 않으며, LLM은 검색 순위를 매길 때만(설정된 경우) 쓰입니다 — 답을
+새로 생성하지 않습니다.
+
+### 실행 방법
+
+1. **뷰어에 이미 마운트되어 있음**: `analyst.run`/`analyst.viewer`를 띄우면 같은 포트에서
+   `/api/v1/...`도 바로 응답합니다(추가 인증 없음 — 뷰어 자체가 127.0.0.1 기본 바인딩).
+2. **독립 실행(읽기 전용)**:
+   ```powershell
+   python -m aioffice.analyst.api --vault <vault> --env .env --port 8790
+   ```
+3. **MCP(OpenCode 등 에이전트용, stdio)**:
+   ```powershell
+   python -m aioffice.analyst.mcp --vault <vault> --env .env
+   ```
+
+### 엔드포인트
+
+| 엔드포인트 | 파라미터 | 설명 |
+|---|---|---|
+| `GET /api/v1` | (없음) | 엔드포인트 목록(파라미터 포함, 자기서술형) |
+| `GET /api/v1/overview` | `as_of` | 리포트/유효·무효 주장/주제/관계 수, 학습 기간, 상위 주제, 최근 배치 |
+| `GET /api/v1/search` | `query`(필수), `k`, `date_from`, `date_to` | 주제·주장 검색(임베딩+재랭커 설정 시 사용, 아니면 3-gram) — LLM 생성 없음 |
+| `GET /api/v1/topics` | (없음) | 주제 목록: id, 이름, 유효 주장 수, 추세, 최근 갱신일 |
+| `GET /api/v1/topics/<id 또는 이름>` | `as_of` | 주제 상세: 요약·추세, 유효/무효 주장(출처 포함), 관련 주제 |
+| `GET /api/v1/changes` | `date_from`, `date_to`(둘 다 필수) | 기간 내 변화: 학습된 리포트, 새 주제, 판단 변화(이전→이후), 무효화, 신규/갱신 관계 |
+| `GET /api/v1/claims` | `entity`, `metric`, `broker`, `type`, `topic`, `date_from`, `date_to`, `valid`(`valid`/`invalid`/`all`, 기본 `valid`), `numeric_only`, `limit`(기본 200), `offset` | 조건별 주장 목록(대시보드용 평탄화된 행, 출처 포함). `entity`/`metric`은 대소문자 구분 없는 부분일치 |
+| `GET /api/v1/metric_history` | `entity`(필수), `metric`(필수), `period` | 증권사별 수치 변경 이력(수정 체인) — 예: "A증권 힌지 수율 72%→65%→70%" |
+
+날짜는 모두 `YYYY-MM-DD`. 에러는 `{"error": "..."}` + 400(파라미터 누락)/404(vault·주제 없음)로
+응답합니다. 리포트에서 나온 항목에는 항상 출처(citation)가 붙습니다:
+`{"report_id", "report_path", "date", "broker", "title", "quote"}` (인용문은 300자로 자름).
+
+### 예시 응답 (가상 데모 vault 기준, 일부 생략)
+
+```
+GET /api/v1/overview
+{"reports": 14, "claims_valid": 67, "claims_invalid": 25, "topics": 9, "relations": 10,
+ "date_range": ["2026-07-01", "2026-08-14"],
+ "top_topics": [{"id": "t009", "name": "온디바이스 AI 스마트폰", "valid_claims": 16}, …],
+ "last_batch": {"n": 1, "path": "batches/001.md"}}
+```
+
+```
+GET /api/v1/claims?metric=수율&limit=2
+{"rows": [{"id": "70fbe550-c3", "date": "2026-08-05", "broker": "A증권",
+           "text": "힌지 협력사 한 곳은 자체 수율이 70% 수준이라고 밝혔다",
+           "metric": "자체 수율", "value": "70", "unit": "%",
+           "topic": {"id": "t004", "name": "폴더블 공급 개선"},
+           "citation": {"report_path": "reports/2026-08-05_a_70fbe550.md", …}}, …],
+ "total": 5}
+```
+
+### 대시보드 연동
+
+사내 대시보드가 지금은 vault의 markdown/숫자를 손으로 파싱한다면, 대신 이 API를 호출하도록
+바꾸세요. `server/scripts/dashboard_client_example.py`(표준 라이브러리 `urllib`만 사용, 약
+40줄)가 `overview` → `claims(metric=…)` → `metric_history`를 차례로 불러 작은 표를 찍는
+전체 흐름을 보여줍니다. 실행:
+
+```powershell
+python server/scripts/dashboard_client_example.py --base-url http://127.0.0.1:8790 --metric 가격
+```
+
+핵심은 세 줄뿐입니다(표준 라이브러리 `urllib.request`):
+
+```python
+import json, urllib.request
+def get(base_url, path):
+    with urllib.request.urlopen(f"{base_url}{path}") as r:
+        return json.loads(r.read().decode("utf-8"))
+rows = get("http://127.0.0.1:8790", "/api/v1/claims?metric=가격&limit=10")["rows"]
+```
+
+### 보안 (다른 PC에 열 때)
+
+기본은 `127.0.0.1`(같은 PC에서만 접속 가능, 인증 없음). `--host`를 loopback이 아닌 값(사내
+다른 PC에서도 접속하게 열 때)으로 주면 **`--token`이 없으면 서버가 아예 시작되지 않습니다**.
+토큰을 주면 모든 요청에 `Authorization: Bearer <token>` 또는 `X-API-Key: <token>` 헤더가
+필요하고, 없거나 틀리면 401입니다. 브라우저 대시보드에서 직접 호출한다면 `--cors <origin>`으로
+그 origin 하나만 CORS를 허용하세요(기본은 CORS 헤더 없음). GET만 지원하며, 이 API는 `.env`나
+vault의 다른 어떤 파일도 서빙하지 않습니다.
+
+```powershell
+python -m aioffice.analyst.api --vault <vault> --host 0.0.0.0 --port 8790 --token <임의의-긴-문자열> --cors http://dashboard.internal
+```
+
+### MCP 등록 (OpenCode)
+
+`opencode.json`에 추가(키 이름은 설치된 OpenCode 버전에 맞게 확인하세요):
+
+```json
+{
+  "mcp": {
+    "ai-analyst": {
+      "type": "local",
+      "command": ["python", "-m", "aioffice.analyst.mcp", "--vault", "<vault 경로>", "--env", "<.env 경로>"],
+      "enabled": true
+    }
+  }
+}
+```
+
+도구 6개: `knowledge_overview`(전체 현황, 대화 시작 시), `search_knowledge`(자연어 검색),
+`get_topic`(주제 상세), `what_changed`(기간 내 변화), `find_claims`(조건별 주장 목록),
+`metric_history`(지표 변경 이력). 각 도구 설명에 언제 쓸지, 출처(`report_path`) 인용 필수,
+숫자는 도구 결과만 사용(추측 금지)이 한글+영어로 적혀 있습니다. 목록/체인 길이는 모델 컨텍스트를
+위해 자동으로 짧게 잘립니다.
+
+지식 API/MCP로 조회한 내용도 아래 11절 "외부 반출 규칙"과 동일하게 취급하세요 —
+`citation`/`quote`에 실제 리포트 문장이 들어있으므로, API 응답을 그대로 회사 밖에 보내지
+마세요.
+
+## 11. 외부 반출 규칙
 
 **나가도 되는 것**: `llm_bench.py` 결과(숫자·라벨만 담긴 `bench_result.json`), 오류의 종류와
 메시지(리포트 문장이 섞여 있지 않은지 먼저 확인), 리포트/주제/주장 **건수**와 처리 소요 시간.

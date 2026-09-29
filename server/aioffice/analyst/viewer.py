@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import Settings
-from . import ingest, learn, render, store
+from . import api, ingest, learn, render, store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 PLACEHOLDER_HTML = "<!doctype html><html><body>분석가 뷰어 (viewer.html 준비 중)</body></html>"
@@ -165,6 +165,10 @@ class Handler(BaseHTTPRequestHandler):
             self._handle_report_changes(query.get("id", [""])[0])
         elif path == "/api/events":
             self._handle_events()
+        elif path.startswith("/api/v1"):
+            # mounted knowledge API -- no extra auth, this server already binds 127.0.0.1
+            status, body = api.dispatch(self.vault, path, query, self.llm)
+            self._send_json(body, status=status)
         else:
             self._send_json({"error": "not found"}, status=404)
 
