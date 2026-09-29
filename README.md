@@ -1,13 +1,46 @@
 # AI Office 사내 작업 안내서
 
-사외 개발 환경에 접근할 수 없는 사내 PC에서 참고하기 위한 문서 모음입니다. 한국어 마크다운 문서와
-독립 실행 가능한 측정 스크립트(`llm_bench.py`) 하나만 둡니다. 리포트 원문·파일명·팀 업무 세부 내용은
-이 저장소에 올리지 않습니다.
+사외 개발 환경에 접근할 수 없는 사내 PC에서 참고하기 위한 문서와 코드 모음입니다. 리포트
+원문·파일명·팀 업무 세부 내용은 이 저장소에 올리지 않습니다.
+
+## 이 저장소는 무엇인가
+
+- **AI 애널리스트** (`server/aioffice/analyst`) — 증권사 리포트를 날짜순으로 10건씩 학습해
+  주제·주장·관계를 Markdown 지식 폴더("vault")와 SQLite에 쌓고, 오프라인 뷰어로 보는 도구입니다.
+- **사내 LLM 벤치마크** — 동시 요청 처리량과 리포트 추출 품질을 재는 독립 실행 스크립트
+  (`llm_bench.py`, 아래 참고).
+- **슬라이드 스튜디오** (`server/aioffice/slides`) — 사내 LLM이 주간 리포트 슬라이드를 라이브로
+  그려주는 이전 작업물입니다. 사용법은 `server/README.md`의 "슬라이드 스튜디오" 절을 보세요.
+
+## 빠른 시작 — AI 애널리스트
+
+1. **받기**: 이 저장소를 사내 PC로 내려받습니다.
+2. **설치** (PowerShell):
+   ```
+   cd server
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install -e ".[dev]"
+   ```
+   PDF 리포트를 읽으려면 `pip install docling`(표·OCR 없이 변환) 또는 `pip install pymupdf`
+   (가볍고 빠름) 중 하나를 추가로 설치하세요. 둘 다 없으면 `.pdf`는 건너뜁니다.
+3. **`.env` 작성**: `Copy-Item .env.example .env` 후 사내 LLM 주소·키·모델을 채웁니다. 키
+   하나하나의 뜻은 [`02-analyst-manual.md`](02-analyst-manual.md)를 보세요.
+4. **리포트 폴더 준비**: 학습할 `.md`/`.txt`/`.pdf` 리포트를 폴더 하나에 모읍니다. 견본은
+   `server/aioffice/analyst/samples/reports/`에 있습니다.
+5. **실행**:
+   ```
+   python -m aioffice.analyst.run --inbox <리포트 폴더> --vault <vault 폴더> --env .env --batch 10
+   ```
+   앱 창이 뜨고 다음 10건 학습이 자동으로 시작됩니다.
 
 ## 문서
 
-- [`01-topic-importance-approaches.md`](01-topic-importance-approaches.md) — 처음 보는 리포트 100~200건에서
-  이번 주 핵심 주제와 주제 간 연관을 찾는 3가지 방법(팀 기억 / 통계 신호 / 팀 판단 학습) 비교
+- [`01-topic-importance-approaches.md`](01-topic-importance-approaches.md) — 처음 보는 리포트
+  100~200건에서 이번 주 핵심 주제와 주제 간 연관을 찾는 3가지 방법 비교
+- [`02-analyst-manual.md`](02-analyst-manual.md) — AI 애널리스트 사용 설명서(설치·화면·학습
+  과정·DB·git·문제 해결)
+- [`AGENTS.md`](AGENTS.md) — 사내 코딩 에이전트(OpenCode)용 운영 지침
 
 ## 사내 LLM 성능 측정 스크립트 — `llm_bench.py`
 

@@ -1,0 +1,1112 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI 애널리스트</title>
+<style>
+:root{
+  --accent:#7c3aed; --accent-ink:#5b21b6; --accent-tint:#f3eefd; --accent-tint2:#ede4fc; --accent-dim:#c4b5fd;
+  --bg:#ffffff; --bg-sidebar:#faf9fc; --bg-panel:#f6f5f9;
+  --ink:#1c1b22; --body:#3c3a45; --muted:#8b8794; --border:#e6e3ec;
+  --green:#16a34a; --green-tint:#e8f7ee; --blue:#2563eb; --blue-tint:#eaf1fd;
+  --amber:#d97706; --amber-tint:#fdf2e3; --red:#dc2626; --red-tint:#fdeaea;
+  --gray:#9ca3af; --gray-tint:#f1f1f3;
+}
+*{box-sizing:border-box;}
+html,body{height:100%;margin:0;}
+body{font-family:'Noto Sans KR','Malgun Gothic',sans-serif;color:var(--body);background:var(--bg);font-size:14px;}
+button,input,select,textarea{font-family:inherit;}
+ul{list-style:none;margin:0;padding:0;}
+#app-shell{display:flex;flex-direction:column;height:100vh;overflow:hidden;}
+
+/* topbar */
+#topbar{flex:0 0 auto;display:flex;align-items:center;gap:10px;padding:0 16px;height:52px;border-bottom:1px solid var(--border);background:#fff;flex-wrap:wrap;}
+#topbar h1{font-size:16px;font-weight:700;color:var(--ink);margin:0 6px 0 0;letter-spacing:-.2px;}
+.chip{background:var(--bg-panel);border:1px solid var(--border);border-radius:999px;padding:3px 10px;font-size:12px;color:var(--body);white-space:nowrap;}
+#chip-model{color:var(--muted);}
+.spacer{flex:1;}
+.btn{border:none;border-radius:6px;padding:7px 16px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,opacity .15s;}
+.btn-primary{background:var(--accent);color:#fff;}
+.btn-primary:hover:not(:disabled){background:var(--accent-ink);}
+.btn-primary:disabled{opacity:.45;cursor:default;}
+.btn-stop{background:var(--red-tint);color:var(--red);display:none;}
+.btn-stop.show{display:inline-block;}
+
+/* body layout */
+#body-row{flex:1;display:flex;min-height:0;}
+
+/* sidebar */
+#sidebar{width:280px;flex:0 0 auto;background:var(--bg-sidebar);border-right:1px solid var(--border);overflow-y:auto;padding:12px;}
+#sidebar-search{width:100%;padding:7px 10px;border:1px solid var(--border);border-radius:6px;font-size:13px;margin-bottom:12px;background:#fff;}
+#sidebar-search:focus{outline:2px solid var(--accent-tint2);border-color:var(--accent);}
+.side-section{margin-bottom:6px;}
+.side-head{display:flex;align-items:center;gap:6px;padding:6px 4px;cursor:pointer;border-radius:6px;user-select:none;}
+.side-head:hover{background:var(--accent-tint);}
+.side-caret{font-size:10px;color:var(--muted);width:10px;display:inline-block;}
+.side-title{font-size:12px;font-weight:700;color:var(--muted);letter-spacing:.3px;flex:1;}
+.side-count{font-size:11px;color:var(--muted);background:var(--bg-panel);border-radius:999px;padding:1px 7px;}
+.side-list{margin:2px 0 8px;}
+.side-section.collapsed .side-list{display:none;}
+.side-item{display:flex;align-items:center;gap:6px;padding:6px 8px;border-radius:6px;cursor:pointer;font-size:12.5px;line-height:1.4;}
+.side-item:hover{background:var(--accent-tint);}
+.side-item.active{background:var(--accent-tint2);box-shadow:inset 2px 0 0 var(--accent);}
+.side-label{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.side-label.strike{text-decoration:line-through;color:var(--muted);}
+.side-sub{font-size:11px;color:var(--muted);flex:0 0 auto;}
+.review-dot{width:8px;height:8px;border-radius:50%;flex:0 0 auto;}
+.dot-none{background:var(--gray);}
+.dot-ok{background:var(--green);}
+.dot-fixed{background:var(--amber);}
+.dot-wrong{background:var(--red);}
+.side-item.hidden-by-search{display:none;}
+.side-section.hidden-by-search{display:none;}
+
+/* main */
+#main{flex:1;display:flex;flex-direction:column;min-width:0;min-height:0;}
+#tabs{flex:0 0 auto;display:flex;gap:2px;padding:8px 16px 0;border-bottom:1px solid var(--border);}
+.tab-btn{background:transparent;border:none;padding:9px 16px;font-size:13px;font-weight:600;color:var(--muted);cursor:pointer;border-radius:8px 8px 0 0;}
+.tab-btn:hover{color:var(--ink);}
+.tab-btn.active{color:var(--accent);background:var(--accent-tint);}
+
+/* doc view */
+#view-doc{flex:1;display:flex;min-height:0;}
+#doc-main{flex:1;min-width:0;display:flex;flex-direction:column;overflow-y:auto;padding:20px 28px;}
+#doc-nav{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+#doc-nav button{background:var(--bg-panel);border:1px solid var(--border);border-radius:6px;width:28px;height:28px;cursor:pointer;color:var(--body);}
+#doc-nav button:hover{background:var(--accent-tint);}
+#doc-path-label{font-size:11.5px;color:var(--muted);}
+#doc-frontmatter{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px;}
+.fm-chip{background:var(--bg-panel);border:1px solid var(--border);border-radius:6px;padding:3px 9px;font-size:11.5px;color:var(--muted);}
+.fm-chip b{color:var(--body);font-weight:600;margin-right:4px;}
+#doc-content{max-width:760px;}
+#doc-content h1{font-size:24px;margin:0 0 14px;color:var(--ink);}
+#doc-content h2{font-size:18px;margin:22px 0 10px;color:var(--ink);border-top:1px solid var(--border);padding-top:16px;}
+#doc-content h3{font-size:15px;margin:16px 0 8px;color:var(--ink);}
+#doc-content p{margin:0 0 12px;line-height:1.7;}
+#doc-content ul,#doc-content ol{margin:0 0 12px;padding-left:22px;line-height:1.7;}
+#doc-content li{margin-bottom:2px;}
+#doc-content blockquote{margin:0 0 12px;padding:8px 14px;border-left:3px solid var(--accent-dim);background:var(--accent-tint);color:var(--body);font-size:13px;}
+#doc-content blockquote p{margin:0;}
+#doc-content code{background:var(--bg-panel);border-radius:4px;padding:1px 5px;font-size:12.5px;font-family:Consolas,monospace;}
+#doc-content table{border-collapse:collapse;margin:0 0 14px;font-size:13px;}
+#doc-content th,#doc-content td{border:1px solid var(--border);padding:6px 12px;text-align:left;}
+#doc-content th{background:var(--bg-panel);}
+#doc-content hr{border:none;border-top:1px solid var(--border);margin:18px 0;}
+#doc-content a.wikilink{color:var(--accent);text-decoration:none;border-bottom:1px solid var(--accent-tint2);}
+#doc-content a.wikilink:hover{border-bottom-color:var(--accent);}
+.pill{display:inline-block;font-size:11px;font-weight:700;padding:1px 8px;border-radius:999px;vertical-align:1px;}
+.pill-new{background:var(--green-tint);color:var(--green);}
+.pill-support{background:var(--blue-tint);color:var(--blue);}
+.pill-fix{background:var(--amber-tint);color:var(--amber);}
+.pill-against{background:var(--red-tint);color:var(--red);}
+.pill-void{background:var(--gray-tint);color:#6b7280;}
+
+/* changes panel */
+#changes-panel{width:300px;flex:0 0 auto;border-left:1px solid var(--border);background:var(--bg-panel);overflow-y:auto;padding:16px;}
+#changes-panel h3{font-size:13px;margin:0 0 12px;color:var(--ink);}
+.cp-section{margin-bottom:16px;}
+.cp-section h4{font-size:11.5px;color:var(--muted);margin:0 0 8px;font-weight:700;}
+.cp-claims,.cp-inv,.cp-topics{display:flex;flex-direction:column;gap:10px;}
+.cp-claim{background:#fff;border:1px solid var(--border);border-radius:8px;padding:8px 10px;}
+.cp-claim-main{display:flex;align-items:flex-start;gap:6px;flex-wrap:wrap;}
+.cp-claim-text{font-size:12.5px;line-height:1.5;flex:1;min-width:120px;}
+.cp-edit-btn{margin-left:auto;background:none;border:none;color:var(--accent);font-size:11.5px;cursor:pointer;padding:0;}
+.cp-claim-meta{margin-top:6px;font-size:11px;color:var(--muted);}
+.warn-tag{font-size:10.5px;color:var(--amber);background:var(--amber-tint);border-radius:4px;padding:1px 6px;}
+.cp-claim-edit{display:flex;flex-direction:column;gap:6px;}
+.cp-claim-edit textarea{width:100%;font-size:12.5px;font-family:inherit;padding:6px;border:1px solid var(--border);border-radius:6px;resize:vertical;min-height:50px;}
+.cp-claim-edit select{font-size:12px;padding:4px;border-radius:6px;border:1px solid var(--border);}
+.cp-edit-actions{display:flex;gap:6px;}
+.cp-edit-actions button,.cp-review-actions button{font-size:12px;padding:5px 12px;border-radius:6px;border:1px solid var(--border);background:#fff;cursor:pointer;}
+.cp-inv-text.strike{text-decoration:line-through;color:var(--muted);}
+.cp-sub{color:var(--muted);}
+.cp-review-status{font-size:12px;color:var(--muted);margin-bottom:8px;}
+.cp-review-actions{display:flex;gap:8px;}
+.btn-ok{color:var(--green)!important;border-color:var(--green-tint)!important;background:var(--green-tint)!important;}
+.btn-wrong{color:var(--red)!important;border-color:var(--red-tint)!important;background:var(--red-tint)!important;}
+.cp-confirm{margin-top:8px;font-size:12px;background:var(--red-tint);padding:8px;border-radius:8px;display:flex;align-items:center;gap:8px;color:var(--red);}
+.cp-confirm[hidden]{display:none;}
+.cp-confirm button{font-size:11.5px;padding:3px 10px;border-radius:5px;border:1px solid var(--red);background:#fff;cursor:pointer;}
+
+/* graph view */
+#view-graph{flex:1;display:flex;flex-direction:column;min-height:0;}
+#graph-toolbar{flex:0 0 auto;display:flex;align-items:center;gap:16px;padding:8px 16px;border-bottom:1px solid var(--border);flex-wrap:wrap;font-size:12px;color:var(--muted);}
+.gf-check{display:flex;align-items:center;gap:5px;cursor:pointer;}
+.gf-dot{width:9px;height:9px;border-radius:50%;display:inline-block;}
+.gf-topic{background:var(--accent);}
+.gf-entity{background:var(--blue);}
+.gf-report{background:var(--gray);}
+.edge-legend{display:flex;align-items:center;gap:12px;}
+.edge-swatch{display:inline-block;width:16px;height:0;border-top:2px solid var(--gray);vertical-align:middle;margin-right:3px;}
+.edge-swatch.related{border-top-color:var(--accent);}
+.edge-swatch.causes{border-top-color:var(--ink);}
+.edge-swatch.affects{border-top-color:#374151;}
+.edge-swatch.contradicts{border-top-color:var(--red);border-top-style:dashed;}
+#graph-date-wrap{display:flex;align-items:center;gap:8px;margin-left:auto;}
+#graph-date-label{min-width:78px;text-align:right;}
+#graph-play{border:1px solid var(--border);background:#fff;border-radius:6px;width:26px;height:26px;cursor:pointer;}
+#graph-canvas-wrap{flex:1;position:relative;min-height:0;background-color:#fff;background-image:radial-gradient(circle,#ece9f5 1px,transparent 1px);background-size:22px 22px;}
+#graph-canvas{width:100%;height:100%;display:block;cursor:grab;}
+#graph-canvas.dragging{cursor:grabbing;}
+#graph-hint{position:absolute;bottom:8px;left:12px;font-size:11px;color:var(--muted);pointer-events:none;}
+
+/* live panel */
+#live-panel{flex:0 0 auto;border-top:1px solid var(--border);background:var(--bg-panel);}
+#live-header{display:flex;align-items:center;gap:10px;padding:8px 16px;cursor:pointer;font-size:12.5px;}
+#live-header .lp-dot{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:0 0 auto;}
+#live-panel.running #live-header .lp-dot{animation:pulse 1.1s infinite;}
+@keyframes pulse{0%,100%{opacity:1;}50%{opacity:.25;}}
+#live-caret{color:var(--muted);font-size:10px;margin-left:auto;}
+#live-summary{color:var(--body);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#live-body{padding:0 16px 12px;}
+#live-panel.collapsed #live-body{display:none;}
+#live-table-wrap{max-height:220px;overflow:auto;border:1px solid var(--border);border-radius:8px;background:#fff;}
+#live-table{width:100%;border-collapse:collapse;font-size:11.5px;white-space:nowrap;}
+#live-table th{position:sticky;top:0;background:var(--bg-panel);color:var(--muted);font-weight:700;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);}
+#live-table td{padding:5px 8px;border-bottom:1px solid var(--border);color:var(--body);}
+#live-table tbody tr.ps-done{cursor:pointer;}
+#live-table tbody tr.ps-done:hover{background:var(--accent-tint);}
+#live-table td.ps-title{max-width:220px;overflow:hidden;text-overflow:ellipsis;}
+.ps-status{display:inline-flex;align-items:center;gap:5px;}
+.ps-spinner{width:10px;height:10px;border:2px solid var(--border);border-top-color:var(--accent);border-radius:50%;display:inline-block;animation:spin .8s linear infinite;}
+@keyframes spin{to{transform:rotate(360deg);}}
+.ps-dot{width:7px;height:7px;border-radius:50%;background:var(--gray);display:inline-block;}
+.ps-check{color:var(--green);font-weight:700;}
+.ps-x{color:var(--red);font-weight:700;}
+.ps-pill{font-size:10px;font-weight:700;padding:0 5px;border-radius:999px;margin-right:2px;display:inline-block;}
+#live-log-toggle{margin-top:8px;font-size:11.5px;color:var(--muted);cursor:pointer;user-select:none;}
+#live-log{max-height:150px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;font-size:12px;padding-top:6px;}
+#live-log.collapsed{display:none;}
+.lp-line{padding:2px 0;}
+.lp-line.err{color:var(--red);}
+.lp-line a{color:var(--accent);}
+</style>
+</head>
+<body>
+<div id="app-shell">
+  <div id="topbar">
+    <h1>AI 애널리스트</h1>
+    <span class="chip" id="chip-learned">학습 0건</span>
+    <span class="chip" id="chip-pending">대기 0건</span>
+    <span class="chip" id="chip-topics">주제 0개</span>
+    <span class="chip" id="chip-claims">주장 0개</span>
+    <span class="chip" id="chip-model">모델 · -</span>
+    <div class="spacer"></div>
+    <button class="btn btn-primary" id="btn-learn">다음 10건 학습</button>
+    <button class="btn btn-stop" id="btn-stop">중지</button>
+  </div>
+
+  <div id="body-row">
+    <aside id="sidebar">
+      <input id="sidebar-search" type="search" placeholder="검색" aria-label="검색">
+      <div id="sidebar-sections"></div>
+    </aside>
+
+    <main id="main">
+      <div id="tabs" role="tablist">
+        <button class="tab-btn" id="tab-doc" data-tab="doc" role="tab">문서</button>
+        <button class="tab-btn" id="tab-graph" data-tab="graph" role="tab">그래프</button>
+      </div>
+
+      <div id="view-doc">
+        <div id="doc-main">
+          <div id="doc-nav">
+            <button id="btn-back" title="뒤로" aria-label="뒤로">◀</button>
+            <button id="btn-fwd" title="앞으로" aria-label="앞으로">▶</button>
+            <span id="doc-path-label"></span>
+          </div>
+          <div id="doc-frontmatter"></div>
+          <div id="doc-content"></div>
+        </div>
+        <div id="changes-panel" hidden></div>
+      </div>
+
+      <div id="view-graph" style="display:none;">
+        <div id="graph-toolbar">
+          <label class="gf-check"><input type="checkbox" class="gf-type" value="topic" checked><span class="gf-dot gf-topic"></span>주제</label>
+          <label class="gf-check"><input type="checkbox" class="gf-type" value="entity" checked><span class="gf-dot gf-entity"></span>기업·제품</label>
+          <label class="gf-check"><input type="checkbox" class="gf-type" value="report" checked><span class="gf-dot gf-report"></span>리포트</label>
+          <div class="edge-legend">
+            <span><span class="edge-swatch about"></span>about/mentions</span>
+            <span><span class="edge-swatch related"></span>related</span>
+            <span><span class="edge-swatch causes"></span>causes</span>
+            <span><span class="edge-swatch affects"></span>affects</span>
+            <span><span class="edge-swatch contradicts"></span>contradicts</span>
+          </div>
+          <div id="graph-date-wrap">
+            <button id="graph-play" title="재생">▶</button>
+            <span>기준일</span>
+            <input type="range" id="graph-date-slider" min="0" max="0" value="0">
+            <span id="graph-date-label">-</span>
+          </div>
+        </div>
+        <div id="graph-canvas-wrap">
+          <canvas id="graph-canvas" role="img" aria-label="지식 그래프"></canvas>
+          <div id="graph-hint">휠: 확대/축소 · 드래그: 이동/노드 이동 · 클릭: 문서 열기</div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <div id="live-panel" class="collapsed">
+    <div id="live-header">
+      <span class="lp-dot"></span>
+      <span id="live-summary">실시간 학습</span>
+      <span id="live-caret">▴</span>
+    </div>
+    <div id="live-body">
+      <div id="live-table-wrap">
+        <table id="live-table">
+          <thead><tr>
+            <th>순서</th><th>날짜</th><th>증권사</th><th>제목</th><th>상태</th>
+            <th>추출 초</th><th>통합 초</th><th>주장</th><th>숫자 확인</th><th>판정</th>
+          </tr></thead>
+          <tbody id="live-table-body"></tbody>
+        </table>
+      </div>
+      <div id="live-log-toggle">이벤트 로그 ▾</div>
+      <div id="live-log" class="collapsed" aria-live="polite"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+"use strict";
+
+/* ---------------- utils ---------------- */
+function escapeHtml(s){ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function escapeAttr(s){ return escapeHtml(s).replace(/"/g,'&quot;'); }
+async function fetchJSON(url, opts){
+  const res = await fetch(url, opts);
+  const data = await res.json().catch(()=>({}));
+  if(!res.ok){ const e = new Error(data.error||res.statusText); e.status=res.status; e.data=data; throw e; }
+  return data;
+}
+function pageKey(path){ return path.endsWith('.md') ? path.slice(0,-3) : path; }
+
+/* ---------------- hash router ---------------- */
+function parseHash(){
+  const raw = location.hash.replace(/^#/, '');
+  const params = new URLSearchParams(raw);
+  const o = {}; for(const [k,v] of params.entries()) o[k]=v; return o;
+}
+function setHash(patch){
+  const cur = parseHash();
+  const next = Object.assign({}, cur, patch);
+  Object.keys(next).forEach(k=>{ if(next[k]==null) delete next[k]; });
+  const params = new URLSearchParams(next);
+  const newHash = '#'+params.toString();
+  if(newHash === location.hash) renderFromHash(false);
+  else location.hash = newHash;
+}
+
+/* ---------------- markdown renderer ---------------- */
+function parseFrontMatter(raw){
+  const lines = raw.split('\n');
+  if(!lines[0] || lines[0].trim()!=='---') return {fm:{}, body:raw};
+  let end=-1;
+  for(let i=1;i<lines.length;i++){ if(lines[i].trim()==='---'){ end=i; break; } }
+  if(end===-1) return {fm:{}, body:raw};
+  const fm={};
+  for(let i=1;i<end;i++){
+    const idx = lines[i].indexOf(':');
+    if(idx===-1) continue;
+    let v = lines[i].slice(idx+1).trim();
+    if(v.length>=2 && ((v[0]==="'" && v[v.length-1]==="'") || (v[0]==='"' && v[v.length-1]==='"'))) v = v.slice(1,-1);
+    fm[lines[i].slice(0,idx).trim()] = v;
+  }
+  return {fm, body: lines.slice(end+1).join('\n')};
+}
+const BADGE_CLASS = {'새로움':'new','강화':'support','수정':'fix','반대':'against','무효':'void'};
+function inline(text){
+  let s = escapeHtml(text);
+  s = s.replace(/\[\[([^\]|]+)(?:\|([^\]]+))?\]\]/g, (m,path,label)=>{
+    path = path.trim(); const lbl = (label?label.trim():path.split('/').pop());
+    return '<a href="#" class="wikilink" data-path="'+escapeAttr(path)+'">'+lbl+'</a>';
+  });
+  s = s.replace(/\{(새로움|강화|수정|반대|무효)\}/g, (m,w)=>'<span class="pill pill-'+BADGE_CLASS[w]+'">'+w+'</span>');
+  s = s.replace(/`([^`]+)`/g, (m,c)=>'<code>'+c+'</code>');
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+  s = s.replace(/\*([^*]+)\*/g, '<em>$1</em>');
+  return s;
+}
+function splitRow(line){
+  let c = line.trim().split('|');
+  if(c.length && c[0].trim()==='') c.shift();
+  if(c.length && c[c.length-1].trim()==='') c.pop();
+  return c.map(x=>x.trim());
+}
+function isSeparatorRow(line){
+  if(!line || !line.includes('|')) return false;
+  const cells = splitRow(line);
+  return cells.length>0 && cells.every(c=>/^:?-+:?$/.test(c));
+}
+function isSpecialStart(line){
+  if(/^#{1,3}\s+/.test(line)) return true;
+  if(/^(-{3,}|\*{3,})\s*$/.test(line.trim())) return true;
+  if(/^>/.test(line.trim())) return true;
+  if(/^\s*([-*]|\d+\.)\s+/.test(line)) return true;
+  if(line.includes('|')) return true;
+  return false;
+}
+function parseList(lines, i, indent){
+  const items = []; let ordered = null;
+  while(i<lines.length){
+    const m = lines[i].match(/^(\s*)([-*]|\d+\.)\s+(.*)$/);
+    if(!m) break;
+    const curIndent = m[1].length;
+    if(curIndent < indent) break;
+    if(curIndent > indent){
+      if(items.length===0) break;
+      const nested = parseList(lines, i, curIndent);
+      items[items.length-1].children = nested.block;
+      i = nested.next; continue;
+    }
+    if(ordered===null) ordered = /\d+\./.test(m[2]);
+    items.push({text:m[3], children:null});
+    i++;
+  }
+  return {block:{t:'list', ordered, items}, next:i};
+}
+function parseBody(text){
+  const lines = text.replace(/\r\n/g,'\n').split('\n');
+  let i=0; const blocks=[];
+  while(i<lines.length){
+    const line = lines[i];
+    if(line.trim()===''){ i++; continue; }
+    let m;
+    if((m = line.match(/^(#{1,3})\s+(.*)$/))){ blocks.push({t:'h', level:m[1].length, text:m[2]}); i++; continue; }
+    if(/^(-{3,}|\*{3,})\s*$/.test(line.trim())){ blocks.push({t:'hr'}); i++; continue; }
+    if(line.trim().startsWith('>')){
+      const qlines=[];
+      while(i<lines.length && lines[i].trim().startsWith('>')){ qlines.push(lines[i].trim().replace(/^>\s?/,'')); i++; }
+      blocks.push({t:'quote', lines:qlines}); continue;
+    }
+    if(line.includes('|') && isSeparatorRow(lines[i+1])){
+      const header = splitRow(line); i+=2; const rows=[];
+      while(i<lines.length && lines[i].includes('|') && lines[i].trim()!==''){ rows.push(splitRow(lines[i])); i++; }
+      blocks.push({t:'table', header, rows}); continue;
+    }
+    if(/^\s*([-*]|\d+\.)\s+/.test(line)){ const res = parseList(lines, i, 0); blocks.push(res.block); i = res.next; continue; }
+    const plines=[line]; i++;
+    while(i<lines.length && lines[i].trim()!=='' && !isSpecialStart(lines[i])){ plines.push(lines[i]); i++; }
+    blocks.push({t:'p', text: plines.join(' ')});
+  }
+  return blocks;
+}
+function renderList(b){
+  const tag = b.ordered ? 'ol':'ul';
+  const items = b.items.map(it=>'<li>'+inline(it.text)+(it.children?renderList(it.children):'')+'</li>').join('');
+  return '<'+tag+'>'+items+'</'+tag+'>';
+}
+function renderTable(b){
+  const thead = '<tr>'+b.header.map(h=>'<th>'+inline(h)+'</th>').join('')+'</tr>';
+  const rows = b.rows.map(r=>'<tr>'+r.map(c=>'<td>'+inline(c)+'</td>').join('')+'</tr>').join('');
+  return '<table><thead>'+thead+'</thead><tbody>'+rows+'</tbody></table>';
+}
+function renderBlock(b){
+  switch(b.t){
+    case 'h': return '<h'+b.level+'>'+inline(b.text)+'</h'+b.level+'>';
+    case 'hr': return '<hr>';
+    case 'quote': return '<blockquote>'+b.lines.map(l=>'<p>'+inline(l)+'</p>').join('')+'</blockquote>';
+    case 'table': return renderTable(b);
+    case 'list': return renderList(b);
+    case 'p': return '<p>'+inline(b.text)+'</p>';
+    default: return '';
+  }
+}
+function renderMarkdown(raw){
+  const {fm, body} = parseFrontMatter(raw);
+  const blocks = parseBody(body);
+  return {fm, html: blocks.map(renderBlock).join('\n')};
+}
+
+/* ---------------- app state ---------------- */
+let TREE = {index:'index.md', log:'log.md', topics:[], reports:[], entities:[], batches:[]};
+let STATUS = {};
+let currentPage = null;
+let activeTab = 'doc';
+let lastChanges = null;
+let lastChangesReport = null;
+let graphNeedsReload = true;
+
+/* ---------------- topbar / status ---------------- */
+function setRunningUI(running){
+  document.getElementById('btn-learn').disabled = !!running;
+  document.getElementById('btn-stop').classList.toggle('show', !!running);
+  document.getElementById('live-panel').classList.toggle('running', !!running);
+}
+function renderChips(s){
+  document.getElementById('chip-learned').textContent = '학습 '+s.learned+'건';
+  document.getElementById('chip-pending').textContent = '대기 '+s.pending+'건';
+  document.getElementById('chip-topics').textContent = '주제 '+s.topics+'개';
+  document.getElementById('chip-claims').textContent = '주장 '+s.claims+'개';
+  document.getElementById('chip-model').textContent = '모델 · '+(s.model||'-');
+}
+async function refreshChips(){ try{ renderChips(await fetchJSON('/api/status')); }catch(e){} }
+
+/* --- batch progress table ------------------------------------------------------------- */
+let batchState = null; // {batch, n, startedAt, items:[{i,report_id,date,broker,title,status,extract_seconds,integrate_seconds,claims,number_fail,counts,path,error}]}
+let batchTickTimer = null;
+function newRow(i){
+  return {i, report_id:null, date:'', broker:'', title:'', status:'waiting',
+          extract_seconds:null, integrate_seconds:null, claims:null, number_fail:null,
+          counts:{new:0,supports:0,updates:0,contradicts:0}, path:null, error:null};
+}
+function normalizeItem(it, i){
+  const row = newRow(i);
+  row.report_id = it.report_id || null; row.date = it.date || ''; row.broker = it.broker || ''; row.title = it.title || '';
+  row.status = it.status || 'waiting';
+  row.extract_seconds = it.extract_seconds ?? null; row.integrate_seconds = it.integrate_seconds ?? null;
+  row.claims = it.claims ?? null; row.number_fail = it.number_fail ?? null;
+  row.counts = {new: it.new||0, supports: it.supports||0, updates: it.updates||0, contradicts: it.contradicts||0};
+  row.path = it.path || null; row.error = it.error || null;
+  return row;
+}
+function findRow(reportId){ return batchState && batchState.items.find(r=>r.report_id===reportId); }
+function formatDuration(sec){
+  sec = Math.max(0, Math.round(sec));
+  if(sec < 60) return sec+'초';
+  return Math.floor(sec/60)+'분 '+(sec%60)+'초';
+}
+function startBatch(batch, n){
+  if(batchTickTimer) clearInterval(batchTickTimer);
+  batchState = {batch, n, startedAt: Date.now(), items: Array.from({length:n}, (_,idx)=>newRow(idx+1))};
+  renderProgressTable();
+  batchTickTimer = setInterval(renderProgressTable, 1000);
+}
+function endBatch(){
+  if(batchTickTimer){ clearInterval(batchTickTimer); batchTickTimer = null; }
+  if(batchState) renderProgressTable();
+}
+function statusCellHTML(row){
+  switch(row.status){
+    case 'extracting': return '<span class="ps-status"><span class="ps-spinner"></span>추출 중…</span>';
+    case 'integrating': return '<span class="ps-status"><span class="ps-spinner"></span>통합 중…</span>';
+    case 'done': return '<span class="ps-status"><span class="ps-check">✓</span>완료</span>';
+    case 'error': return '<span class="ps-status"><span class="ps-x">✕</span>오류</span>';
+    default: return '<span class="ps-status"><span class="ps-dot"></span>대기</span>';
+  }
+}
+const VERDICT_PILL = {new:['새로움','pill-new'], supports:['강화','pill-support'], updates:['수정','pill-fix'], contradicts:['반대','pill-against']};
+function verdictCellHTML(row){
+  if(row.status!=='done' && row.status!=='error') return '-';
+  const parts = Object.entries(row.counts).filter(([,n])=>n>0).map(([k,n])=>{
+    const [label,cls] = VERDICT_PILL[k];
+    return '<span class="pill ps-pill '+cls+'">'+label+' '+n+'</span>';
+  });
+  return parts.length ? parts.join('') : '-';
+}
+function renderProgressTable(){
+  if(!batchState) return;
+  const done = batchState.items.filter(r=>r.status==='done'||r.status==='error').length;
+  const elapsed = (Date.now() - batchState.startedAt)/1000;
+  const finished = batchState.items.filter(r=>r.status==='done' && r.extract_seconds!=null && r.integrate_seconds!=null);
+  let eta = '계산 중';
+  if(finished.length){
+    const avg = finished.reduce((a,r)=>a+r.extract_seconds+r.integrate_seconds,0)/finished.length;
+    const remaining = batchState.n - done;
+    eta = remaining>0 ? '약 '+formatDuration(avg*remaining) : '완료';
+  }
+  document.getElementById('live-summary').textContent =
+    '배치 '+batchState.batch+' · '+done+'/'+batchState.n+' 완료 · 경과 '+formatDuration(elapsed)+' · 예상 남은 시간 '+eta;
+  const tbody = document.getElementById('live-table-body');
+  tbody.innerHTML = batchState.items.map(row=>
+    '<tr class="ps-'+row.status+'" data-path="'+(row.path?escapeAttr(pageKey(row.path)):'')+'">'+
+    '<td>'+row.i+'</td><td>'+escapeHtml(row.date||'-')+'</td><td>'+escapeHtml(row.broker||'-')+'</td>'+
+    '<td class="ps-title" title="'+escapeAttr(row.title||'')+'">'+escapeHtml(row.title||'-')+'</td>'+
+    '<td>'+statusCellHTML(row)+'</td>'+
+    '<td>'+(row.extract_seconds!=null?row.extract_seconds.toFixed(1):'-')+'</td>'+
+    '<td>'+(row.integrate_seconds!=null?row.integrate_seconds.toFixed(1):'-')+'</td>'+
+    '<td>'+(row.claims ?? '-')+'</td>'+
+    '<td>'+(row.number_fail ?? '-')+'</td>'+
+    '<td>'+verdictCellHTML(row)+'</td></tr>').join('');
+}
+document.getElementById('live-table-body').addEventListener('click', (e)=>{
+  const tr = e.target.closest('tr.ps-done');
+  if(tr && tr.dataset.path) setHash({tab:'doc', page: tr.dataset.path});
+});
+document.getElementById('live-log-toggle').addEventListener('click', ()=>{
+  const log = document.getElementById('live-log');
+  log.classList.toggle('collapsed');
+  document.getElementById('live-log-toggle').textContent = '이벤트 로그 ' + (log.classList.contains('collapsed') ? '▾' : '▸');
+});
+
+function hydrateStatus(s){
+  STATUS = s;
+  renderChips(s);
+  setRunningUI(s.running);
+  if(s.progress && Array.isArray(s.progress.items)){
+    batchState = {batch: s.progress.batch, n: s.progress.items.length, startedAt: Date.now(),
+                  items: s.progress.items.map((it,idx)=>normalizeItem(it, idx+1))};
+    renderProgressTable();
+    if(s.running){ setLiveOpen(true); if(batchTickTimer) clearInterval(batchTickTimer); batchTickTimer = setInterval(renderProgressTable, 1000); }
+  } else if(!s.running){
+    endBatch();
+  }
+}
+async function refreshStatus(){ try{ hydrateStatus(await fetchJSON('/api/status')); }catch(e){} }
+
+/* ---------------- sidebar ---------------- */
+function sideItemHTML(o){
+  const dotHTML = o.review!==undefined ?
+    '<span class="review-dot dot-'+(o.review==='ok'?'ok':o.review==='fixed'?'fixed':o.review==='wrong'?'wrong':'none')+'"></span>' : '';
+  return '<li class="side-item" data-path="'+escapeAttr(o.path)+'" data-search="'+escapeAttr((o.search||o.label).toLowerCase())+'">'+
+    '<span class="side-label'+(o.rolledBack?' strike':'')+'">'+escapeHtml(o.label)+'</span>'+
+    (o.sub?'<span class="side-sub">'+escapeHtml(o.sub)+'</span>':'')+ dotHTML + '</li>';
+}
+function buildSidebar(){
+  const sections = [
+    {key:'overview', title:'개요', noCount:true, items:[
+      {label:'개요', path:'index', search:'개요 index'},
+      {label:'학습 기록', path:'log', search:'학습 기록 log'}]},
+    {key:'topics', title:'주제', items: TREE.topics.map(t=>({label:t.name, sub:t.claims+'건', path:pageKey(t.path), search:t.name}))},
+    {key:'reports', title:'리포트', items: TREE.reports.map(r=>({label:r.date+' · '+r.broker+' · '+r.title, path:pageKey(r.path),
+      search:r.broker+' '+r.title+' '+r.date, review:r.review, rolledBack:r.status==='rolled_back'}))},
+    {key:'entities', title:'기업·제품', items: TREE.entities.map(e=>({label:e.name, sub:e.count+'회', path:pageKey(e.path), search:e.name}))},
+    {key:'batches', title:'배치 기록', items: TREE.batches.map(b=>({label:'배치 '+String(b.n).padStart(3,'0'), path:pageKey(b.path), search:'배치 '+b.n}))}
+  ];
+  const html = sections.map(s=>
+    '<div class="side-section" data-key="'+s.key+'">'+
+      '<div class="side-head" data-key="'+s.key+'"><span class="side-caret">▾</span><span class="side-title">'+s.title+'</span>'+
+        (s.noCount?'':'<span class="side-count">'+s.items.length+'</span>')+'</div>'+
+      '<ul class="side-list">'+s.items.map(sideItemHTML).join('')+'</ul>'+
+    '</div>').join('');
+  document.getElementById('sidebar-sections').innerHTML = html;
+  highlightActiveSidebar(currentPage);
+  applySidebarSearch(document.getElementById('sidebar-search').value);
+}
+function highlightActiveSidebar(path){
+  document.querySelectorAll('.side-item').forEach(li=>li.classList.toggle('active', li.dataset.path===path));
+}
+function applySidebarSearch(val){
+  const q = val.trim().toLowerCase();
+  document.querySelectorAll('.side-section').forEach(sec=>{
+    if(sec.dataset.key==='overview') return;
+    let anyVisible = false;
+    sec.querySelectorAll('.side-item').forEach(li=>{
+      const match = !q || li.dataset.search.includes(q);
+      li.classList.toggle('hidden-by-search', !match);
+      if(match) anyVisible = true;
+    });
+    sec.classList.toggle('hidden-by-search', !!q && !anyVisible);
+  });
+}
+async function refreshTree(){ TREE = await fetchJSON('/api/tree'); buildSidebar(); }
+
+/* sidebar interactions */
+document.getElementById('sidebar-sections').addEventListener('click', (e)=>{
+  const head = e.target.closest('.side-head');
+  if(head){ const sec = head.closest('.side-section'); sec.classList.toggle('collapsed');
+    head.querySelector('.side-caret').textContent = sec.classList.contains('collapsed') ? '▸' : '▾'; return; }
+  const item = e.target.closest('.side-item');
+  if(item){ setHash({tab:'doc', page:item.dataset.path}); }
+});
+document.getElementById('sidebar-search').addEventListener('input', (e)=>applySidebarSearch(e.target.value));
+
+/* ---------------- doc view ---------------- */
+function findReportByPage(path){ return TREE.reports.find(r=>pageKey(r.path)===path); }
+const RELATION_LABEL = {new:'새로움', supports:'강화', updates:'수정', contradicts:'반대'};
+const RELATION_PILL = {new:'pill-new', supports:'pill-support', updates:'pill-fix', contradicts:'pill-against'};
+
+function claimRowHTML(c){
+  return '<li class="cp-claim" data-id="'+c.id+'"><div class="cp-claim-main">'+
+    '<span class="pill '+RELATION_PILL[c.relation]+'">'+RELATION_LABEL[c.relation]+'</span>'+
+    '<span class="cp-claim-text">'+inline(c.text)+'</span>'+
+    (!c.number_ok?'<span class="warn-tag">숫자 확인 필요</span>':'')+
+    '<button class="cp-edit-btn" data-id="'+c.id+'">수정</button></div>'+
+    '<div class="cp-claim-meta">주제: <a href="#" class="wikilink" data-path="topics/'+c.topic.id+'">'+escapeHtml(c.topic.name)+'</a>'+
+    (c.target?' · 대상: '+escapeHtml(c.target.text)+' ('+c.target.report_date+')':'')+'</div></li>';
+}
+function reviewLabel(r){ return r==='ok'?'맞음':r==='fixed'?'수정됨':r==='wrong'?'틀림(되돌림)':'없음'; }
+function renderChangesPanel(){
+  const data = lastChanges, report = lastChangesReport;
+  if(!data || !report){ document.getElementById('changes-panel').hidden = true; return; }
+  const panel = document.getElementById('changes-panel');
+  panel.hidden = false;
+  let html = '<h3>이 리포트가 바꾼 것</h3>';
+  html += '<div class="cp-section"><h4>주장 ('+data.claims.length+')</h4><ul class="cp-claims">'+data.claims.map(claimRowHTML).join('')+'</ul></div>';
+  if(data.invalidated.length){
+    html += '<div class="cp-section"><h4>무효화된 주장</h4><ul class="cp-inv">'+data.invalidated.map(v=>
+      '<li><span class="pill pill-void">무효</span> <span class="cp-inv-text strike">'+escapeHtml(v.text)+'</span> <span class="cp-sub">('+escapeHtml(v.topic_name)+')</span></li>').join('')+'</ul></div>';
+  }
+  if(data.topics_created.length || data.topics_updated.length){
+    html += '<div class="cp-section"><h4>주제 변화</h4><ul class="cp-topics">'+
+      data.topics_created.map(t=>'<li>새 주제: <a href="#" class="wikilink" data-path="topics/'+t.id+'">'+escapeHtml(t.name)+'</a></li>').join('')+
+      data.topics_updated.map(t=>'<li>주제 갱신: <a href="#" class="wikilink" data-path="topics/'+t.id+'">'+escapeHtml(t.name)+'</a></li>').join('')+
+      '</ul></div>';
+  }
+  html += '<div class="cp-section cp-review"><h4>검토</h4>'+
+    '<div class="cp-review-status">현재: '+reviewLabel(report.review)+'</div>'+
+    '<div class="cp-review-actions"><button class="btn-ok" data-act="ok">맞음</button><button class="btn-wrong" data-act="wrong">틀림(되돌리기)</button></div>'+
+    '<div class="cp-confirm" hidden><span>정말 되돌리시겠습니까?</span><button data-act="confirm-yes">예</button><button data-act="confirm-no">아니오</button></div>'+
+    '</div>';
+  panel.innerHTML = html;
+}
+async function loadReportChanges(reportId){
+  lastChangesReport = TREE.reports.find(r=>r.id===reportId);
+  lastChanges = await fetchJSON('/api/report_changes?id='+encodeURIComponent(reportId));
+  renderChangesPanel();
+}
+async function loadDocPage(path){
+  currentPage = path;
+  highlightActiveSidebar(path);
+  document.getElementById('doc-path-label').textContent = path;
+  let data;
+  try{ data = await fetchJSON('/api/page?path='+encodeURIComponent(path+'.md')); }
+  catch(e){ document.getElementById('doc-content').innerHTML = '<p>페이지를 찾을 수 없습니다: '+escapeHtml(path)+'</p>'; document.getElementById('changes-panel').hidden=true; return; }
+  const {fm, html} = renderMarkdown(data.markdown);
+  document.getElementById('doc-content').innerHTML = html;
+  document.getElementById('doc-frontmatter').innerHTML = Object.keys(fm).map(k=>
+    '<span class="fm-chip"><b>'+escapeHtml(k)+'</b>'+escapeHtml(fm[k])+'</span>').join('');
+  const report = findReportByPage(path);
+  if(report){ await loadReportChanges(report.id); }
+  else { document.getElementById('changes-panel').hidden = true; lastChanges=null; lastChangesReport=null; }
+}
+document.getElementById('doc-content').addEventListener('click', (e)=>{
+  const a = e.target.closest('a.wikilink');
+  if(a){ e.preventDefault(); setHash({tab:'doc', page:a.dataset.path}); }
+});
+document.getElementById('btn-back').addEventListener('click', ()=>history.back());
+document.getElementById('btn-fwd').addEventListener('click', ()=>history.forward());
+
+/* changes panel interactions */
+document.getElementById('changes-panel').addEventListener('click', async (e)=>{
+  const wl = e.target.closest('a.wikilink');
+  if(wl){ e.preventDefault(); setHash({tab:'doc', page:wl.dataset.path}); return; }
+  const editBtn = e.target.closest('.cp-edit-btn');
+  if(editBtn){
+    const claim = lastChanges.claims.find(c=>c.id===editBtn.dataset.id);
+    const li = editBtn.closest('.cp-claim');
+    const opts = TREE.topics.map(t=>'<option value="'+t.id+'"'+(t.id===claim.topic.id?' selected':'')+'>'+escapeHtml(t.name)+'</option>').join('');
+    li.innerHTML = '<div class="cp-claim-edit"><textarea class="cp-edit-text">'+escapeHtml(claim.text)+'</textarea>'+
+      '<select class="cp-edit-topic">'+opts+'</select>'+
+      '<div class="cp-edit-actions"><button class="cp-save" data-id="'+claim.id+'">저장</button><button class="cp-cancel">취소</button></div></div>';
+    return;
+  }
+  const cancelBtn = e.target.closest('.cp-cancel');
+  if(cancelBtn){ renderChangesPanel(); return; }
+  const saveBtn = e.target.closest('.cp-save');
+  if(saveBtn){
+    const li = saveBtn.closest('.cp-claim');
+    const text = li.querySelector('.cp-edit-text').value;
+    const topic_id = li.querySelector('.cp-edit-topic').value;
+    await fetchJSON('/api/claim', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({claim_id: saveBtn.dataset.id, text, topic_id})});
+    await refreshAll();
+    return;
+  }
+  const act = e.target.closest('button[data-act]');
+  if(act){
+    const kind = act.dataset.act;
+    if(kind==='wrong'){ document.querySelector('.cp-review-actions').style.display='none'; document.querySelector('.cp-confirm').hidden=false; return; }
+    if(kind==='confirm-no'){ document.querySelector('.cp-review-actions').style.display=''; document.querySelector('.cp-confirm').hidden=true; return; }
+    const verdict = kind==='ok' ? 'ok' : kind==='confirm-yes' ? 'wrong' : null;
+    if(verdict){ await fetchJSON('/api/review', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({report_id: lastChangesReport.id, verdict})}); await refreshAll(); }
+  }
+});
+
+async function refreshAll(){
+  await refreshTree();
+  await loadDocPage(currentPage);
+  if(activeTab==='graph') await reloadGraphFull();
+  else graphNeedsReload = true;
+}
+
+/* ---------------- learn / stop ---------------- */
+document.getElementById('btn-learn').addEventListener('click', async ()=>{
+  try{ await fetchJSON('/api/learn', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({batch:10})}); }
+  catch(e){ pushLog('학습 시작 실패: '+(e.message||'')); }
+});
+document.getElementById('btn-stop').addEventListener('click', async ()=>{
+  await fetchJSON('/api/learn/stop', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'});
+});
+
+/* ---------------- live panel / SSE ---------------- */
+function pushLog(text, cls){
+  const log = document.getElementById('live-log');
+  const div = document.createElement('div');
+  div.className = 'lp-line'+(cls?(' '+cls):'');
+  div.innerHTML = text;
+  log.appendChild(div);
+  log.scrollTop = log.scrollHeight;
+}
+function setLiveOpen(open){ document.getElementById('live-panel').classList.toggle('collapsed', !open); }
+document.getElementById('live-header').addEventListener('click', ()=>{
+  const p = document.getElementById('live-panel');
+  p.classList.toggle('collapsed');
+  document.getElementById('live-caret').textContent = p.classList.contains('collapsed') ? '▾' : '▴';
+});
+
+let es = null;
+function connectSSE(){
+  if(es) es.close();
+  es = new EventSource('/api/events');
+  es.addEventListener('batch_start', (ev)=>{
+    const d = JSON.parse(ev.data);
+    setLiveOpen(true);
+    setRunningUI(true);
+    startBatch(d.batch, d.n);
+    pushLog('배치 '+d.batch+' 시작 · '+d.n+'건');
+  });
+  es.addEventListener('report_start', (ev)=>{
+    const d = JSON.parse(ev.data);
+    if(!batchState) startBatch(Math.ceil(d.i/d.n) || 1, d.n); // reconnect mid-batch without a batch_start
+    const row = batchState.items[d.i-1];
+    if(row){ row.report_id = d.report_id; row.date = d.date; row.broker = d.broker; row.title = d.title; }
+    renderProgressTable();
+  });
+  es.addEventListener('extract_start', (ev)=>{
+    const d = JSON.parse(ev.data);
+    const row = findRow(d.report_id);
+    if(row){ row.status = 'extracting'; renderProgressTable(); }
+  });
+  es.addEventListener('extracted', (ev)=>{
+    const d = JSON.parse(ev.data);
+    const row = findRow(d.report_id);
+    if(row){ row.claims = d.claims; row.number_fail = d.number_fail; row.extract_seconds = d.seconds; renderProgressTable(); }
+  });
+  es.addEventListener('integrate_start', (ev)=>{
+    const d = JSON.parse(ev.data);
+    const row = findRow(d.report_id);
+    if(row){ row.status = 'integrating'; renderProgressTable(); }
+  });
+  es.addEventListener('integrated', (ev)=>{
+    const d = JSON.parse(ev.data);
+    const row = findRow(d.report_id);
+    if(row){
+      row.integrate_seconds = d.seconds;
+      row.counts = {new:d.new||0, supports:d.supports||0, updates:d.updates||0, contradicts:d.contradicts||0};
+      renderProgressTable();
+    }
+    (d.topics_created||[]).forEach(n=>pushLog('새 주제: '+escapeHtml(n)));
+    (d.topics_updated||[]).forEach(n=>pushLog('주제 갱신: '+escapeHtml(n)+' <span class="pill pill-fix">수정</span>'));
+  });
+  es.addEventListener('report_done', (ev)=>{
+    const d = JSON.parse(ev.data);
+    const row = findRow(d.report_id);
+    if(row){
+      row.status = 'done'; row.path = d.path;
+      const failTxt = row.number_fail ? ' (숫자 확인 필요 '+row.number_fail+')' : '';
+      pushLog((row.broker||'')+' '+((row.date||'').slice(5))+' · 주장 '+(row.claims||0)+'개'+failTxt+' · '+(row.integrate_seconds||0)+'초');
+      renderProgressTable();
+    }
+    refreshTree();
+    if(activeTab==='graph') reloadGraphFull(); else graphNeedsReload = true;
+  });
+  es.addEventListener('consolidated', (ev)=>{
+    const d = JSON.parse(ev.data);
+    pushLog('정리 완료 · 주제 '+d.topics+' · 관계 '+d.relations+' · '+d.seconds+'초');
+    refreshTree();
+    if(activeTab==='graph') reloadGraphFull(); else graphNeedsReload = true;
+  });
+  es.addEventListener('batch_done', (ev)=>{
+    const d = JSON.parse(ev.data);
+    pushLog('배치 '+d.batch+' 완료 · <a href="#" data-path="'+escapeAttr(pageKey(d.path))+'">보기</a>');
+    setRunningUI(false);
+    endBatch();
+    refreshChips(); refreshTree();
+  });
+  es.addEventListener('review_done', (ev)=>{
+    const d = JSON.parse(ev.data);
+    refreshTree();
+    if(lastChangesReport && lastChangesReport.id===d.report_id) loadDocPage(currentPage);
+  });
+  es.addEventListener('error', (ev)=>{
+    try{
+      const d = JSON.parse(ev.data);
+      const row = d.report_id ? findRow(d.report_id) : null;
+      if(row){ row.status = 'error'; row.error = d.text; renderProgressTable(); }
+      pushLog('오류: '+escapeHtml(d.text), 'err');
+    }catch(e){}
+  });
+  es.onerror = ()=>{ es.close(); setTimeout(()=>{ connectSSE(); refreshStatus(); }, 2000); };
+}
+document.getElementById('live-log').addEventListener('click', (e)=>{
+  const a = e.target.closest('a[data-path]');
+  if(a){ e.preventDefault(); setHash({tab:'doc', page:a.dataset.path}); }
+});
+
+/* ---------------- graph view ---------------- */
+let gcanvas, gctx, dpr = window.devicePixelRatio||1;
+let graphNodes = [], graphEdges = [], graphDates = null;
+let zoom = 1, panX = 0, panY = 0;
+let simRunning = false, settled = true, lowKeStreak = 0;
+let hoverNode = null, dragNode = null, dragged = false, panning = false, lastMouse = null;
+let hiddenTypes = new Set();
+let playTimer = null;
+let graphInited = false;
+
+function ensureGraphInit(){
+  if(graphInited) return;
+  graphInited = true;
+  gcanvas = document.getElementById('graph-canvas');
+  gctx = gcanvas.getContext('2d');
+  window.addEventListener('resize', ()=>{ if(activeTab==='graph'){ resizeGraphCanvas(); requestRender(); } });
+  gcanvas.addEventListener('wheel', onWheel, {passive:false});
+  gcanvas.addEventListener('mousedown', onMouseDown);
+  window.addEventListener('mousemove', onMouseMove);
+  window.addEventListener('mouseup', onMouseUp);
+  gcanvas.addEventListener('click', onClick);
+  document.querySelectorAll('.gf-type').forEach(cb=>cb.addEventListener('change', ()=>{
+    if(cb.checked) hiddenTypes.delete(cb.value); else hiddenTypes.add(cb.value);
+    requestRender();
+  }));
+  document.getElementById('graph-date-slider').addEventListener('input', onDateSlide);
+  document.getElementById('graph-play').addEventListener('click', togglePlay);
+}
+function resizeGraphCanvas(){
+  const wrap = document.getElementById('graph-canvas-wrap');
+  dpr = window.devicePixelRatio||1;
+  gcanvas.width = wrap.clientWidth*dpr; gcanvas.height = wrap.clientHeight*dpr;
+}
+function dayIndex(dateStr, base){ return Math.round((Date.parse(dateStr)-base)/86400000); }
+async function reloadGraphFull(){
+  resizeGraphCanvas();
+  const data = await fetchJSON('/api/graph');
+  graphDates = data.dates;
+  const minT = Date.parse(graphDates[0]), maxT = Date.parse(graphDates[1]);
+  const maxDay = Math.max(1, Math.round((maxT-minT)/86400000));
+  const slider = document.getElementById('graph-date-slider');
+  slider.min = 0; slider.max = maxDay; slider.value = maxDay;
+  document.getElementById('graph-date-label').textContent = graphDates[1];
+  applyGraphData(data, {merge:false});
+}
+async function onDateSlide(){
+  const slider = document.getElementById('graph-date-slider');
+  const minT = Date.parse(graphDates[0]);
+  const asOf = new Date(minT + slider.value*86400000).toISOString().slice(0,10);
+  document.getElementById('graph-date-label').textContent = asOf;
+  const data = await fetchJSON('/api/graph?as_of='+asOf);
+  applyGraphData(data, {merge:true});
+}
+function togglePlay(){
+  const btn = document.getElementById('graph-play');
+  if(playTimer){ clearInterval(playTimer); playTimer=null; btn.textContent='▶'; return; }
+  btn.textContent='❚❚';
+  const slider = document.getElementById('graph-date-slider');
+  playTimer = setInterval(()=>{
+    const v = parseInt(slider.value,10);
+    if(v >= parseInt(slider.max,10)){ clearInterval(playTimer); playTimer=null; btn.textContent='▶'; return; }
+    slider.value = v+1;
+    onDateSlide();
+  }, 450);
+}
+function applyGraphData(data, opts){
+  const merge = opts && opts.merge;
+  const now = performance.now();
+  const existing = new Map(graphNodes.map(n=>[n.id,n]));
+  const n = data.nodes.length;
+  const nextNodes = data.nodes.map((raw, idx)=>{
+    let node = existing.get(raw.id);
+    if(!node){
+      const theta = (idx/Math.max(1,n))*Math.PI*2, R = 150;
+      node = {id:raw.id, x:R*Math.cos(theta)+(Math.random()-0.5)*20, y:R*Math.sin(theta)+(Math.random()-0.5)*20, vx:0, vy:0, dragging:false};
+      if(merge) node.pulseUntil = now+1500;
+    }
+    node.type = raw.type; node.label = raw.label; node.date = raw.date; node.status = raw.status;
+    node.r = 4 + Math.min(raw.size,26)*0.6;
+    return node;
+  });
+  graphNodes = nextNodes;
+  const map = new Map(graphNodes.map(nd=>[nd.id,nd]));
+  graphEdges = data.edges.map(e=>({s:map.get(e.source), t:map.get(e.target), kind:e.kind})).filter(e=>e.s && e.t);
+  settled = false; lowKeStreak = 0; wakeSim();
+}
+
+/* physics: O(n^2) repulsion, fine to ~1500 nodes per spec; stops once kinetic energy settles.
+   ponytail: naive O(n^2) pair loop, upgrade to Barnes-Hut quadtree if node count grows far past ~1500. */
+function physicsStep(){
+  const REPEL = 4200, SPRING_K = 0.02, REST = 140, DAMPING = 0.82, CENTER_K = 0.01;
+  for(const A of graphNodes){ A.fx=0; A.fy=0; }
+  for(let a=0;a<graphNodes.length;a++){
+    const A = graphNodes[a];
+    for(let b=a+1;b<graphNodes.length;b++){
+      const B = graphNodes[b];
+      let dx=A.x-B.x, dy=A.y-B.y, d2=dx*dx+dy*dy; if(d2<1) d2=1;
+      const d=Math.sqrt(d2), f=REPEL/d2, ux=dx/d, uy=dy/d;
+      A.fx += ux*f; A.fy += uy*f; B.fx -= ux*f; B.fy -= uy*f;
+    }
+    A.fx += -A.x*CENTER_K; A.fy += -A.y*CENTER_K;
+  }
+  for(const E of graphEdges){
+    const A=E.s, B=E.t;
+    const rest = (A.type!=='report' && B.type!=='report') ? 240 : REST; // spread the topic/entity hub further apart
+    let dx=B.x-A.x, dy=B.y-A.y, d=Math.sqrt(dx*dx+dy*dy)||0.01;
+    const f=(d-rest)*SPRING_K, ux=dx/d, uy=dy/d;
+    A.fx += ux*f; A.fy += uy*f; B.fx -= ux*f; B.fy -= uy*f;
+  }
+  let ke = 0;
+  for(const A of graphNodes){
+    if(A.dragging){ A.vx=0; A.vy=0; continue; }
+    A.vx = (A.vx + A.fx*0.02)*DAMPING; A.vy = (A.vy + A.fy*0.02)*DAMPING;
+    A.x += A.vx; A.y += A.vy;
+    ke += A.vx*A.vx+A.vy*A.vy;
+  }
+  if(ke < 0.02){ lowKeStreak++; if(lowKeStreak>15) settled = true; } else lowKeStreak = 0;
+}
+function wakeSim(){ if(!simRunning){ simRunning = true; requestAnimationFrame(tick); } }
+function requestRender(){ if(!simRunning) render(); }
+function tick(){
+  if(!settled) physicsStep();
+  render();
+  if(!settled) requestAnimationFrame(tick); else simRunning = false;
+}
+function neighborsOf(node){
+  const set = new Set();
+  for(const E of graphEdges){ if(E.s===node) set.add(E.t); if(E.t===node) set.add(E.s); }
+  return set;
+}
+function drawArrow(ctx, x1,y1,x2,y2, r){
+  const ang = Math.atan2(y2-y1, x2-x1);
+  const tx = x2 - Math.cos(ang)*r, ty = y2 - Math.sin(ang)*r;
+  const size = 6;
+  ctx.beginPath();
+  ctx.moveTo(tx, ty);
+  ctx.lineTo(tx - size*Math.cos(ang-0.4), ty - size*Math.sin(ang-0.4));
+  ctx.lineTo(tx - size*Math.cos(ang+0.4), ty - size*Math.sin(ang+0.4));
+  ctx.closePath(); ctx.fill();
+}
+const TYPE_COLOR = {topic:'#7c3aed', entity:'#2563eb', report:'#9ca3af'};
+function render(){
+  if(!gctx) return;
+  gctx.setTransform(dpr,0,0,dpr,0,0);
+  gctx.clearRect(0,0,gcanvas.width,gcanvas.height);
+  const cw = gcanvas.width/dpr, ch = gcanvas.height/dpr;
+  gctx.translate(cw/2+panX, ch/2+panY);
+  gctx.scale(zoom, zoom);
+  const neighbors = hoverNode ? neighborsOf(hoverNode) : null;
+  for(const E of graphEdges){
+    if(hiddenTypes.has(E.s.type) || hiddenTypes.has(E.t.type)) continue;
+    const dim = hoverNode && E.s!==hoverNode && E.t!==hoverNode;
+    let color = '#9ca3af', width = 1, alpha = E.kind==='mentions'?0.55:0.9, dash = [];
+    if(E.kind==='related'){ color='#7c3aed'; width=1.6; alpha=0.85; }
+    else if(E.kind==='causes'){ color='#1c1b22'; width=1.8; alpha=0.85; }
+    else if(E.kind==='affects'){ color='#374151'; width=1.3; alpha=0.8; }
+    else if(E.kind==='contradicts'){ color='#dc2626'; width=1.6; alpha=0.85; dash=[5,4]; }
+    gctx.globalAlpha = dim ? alpha*0.15 : alpha;
+    gctx.strokeStyle = color; gctx.fillStyle = color; gctx.lineWidth = width/zoom;
+    gctx.setLineDash(dash.map(d=>d/zoom));
+    gctx.beginPath(); gctx.moveTo(E.s.x, E.s.y); gctx.lineTo(E.t.x, E.t.y); gctx.stroke();
+    if(E.kind==='causes' || E.kind==='affects') drawArrow(gctx, E.s.x, E.s.y, E.t.x, E.t.y, E.t.r/zoom+2);
+    gctx.setLineDash([]);
+  }
+  const now = performance.now();
+  for(const N of graphNodes){
+    if(hiddenTypes.has(N.type)) continue;
+    const dim = hoverNode && N!==hoverNode && neighbors && !neighbors.has(N);
+    const faded = N.status && N.status!=='active';
+    gctx.globalAlpha = (dim?0.2:1) * (faded?0.35:1);
+    gctx.fillStyle = TYPE_COLOR[N.type] || '#9ca3af';
+    gctx.beginPath(); gctx.arc(N.x, N.y, N.r/zoom, 0, Math.PI*2); gctx.fill();
+    if(N===hoverNode){ gctx.lineWidth = 2/zoom; gctx.strokeStyle = '#1c1b22'; gctx.stroke(); }
+    if(N.pulseUntil && N.pulseUntil > now){
+      const t = 1 - (N.pulseUntil-now)/1500;
+      gctx.globalAlpha = 1-t; gctx.strokeStyle = '#7c3aed'; gctx.lineWidth = 2/zoom;
+      gctx.beginPath(); gctx.arc(N.x, N.y, N.r/zoom + t*14/zoom, 0, Math.PI*2); gctx.stroke();
+    } else if(N.pulseUntil){ N.pulseUntil = null; }
+    const showLabel = N.type==='topic' || N===hoverNode || zoom>1.3;
+    if(showLabel && !dim){
+      gctx.globalAlpha = faded?0.5:1;
+      gctx.fillStyle = '#1c1b22'; gctx.font = (11/zoom)+'px "Noto Sans KR",sans-serif';
+      gctx.fillText(N.label, N.x + N.r/zoom + 4, N.y + 4/zoom);
+    }
+  }
+  gctx.globalAlpha = 1;
+}
+function toWorld(clientX, clientY){
+  const rect = gcanvas.getBoundingClientRect();
+  const cw = rect.width, ch = rect.height;
+  const sx = clientX - rect.left, sy = clientY - rect.top;
+  return { x: (sx - cw/2 - panX)/zoom, y: (sy - ch/2 - panY)/zoom };
+}
+function hitTest(clientX, clientY){
+  const p = toWorld(clientX, clientY);
+  let best = null, bestD = Infinity;
+  for(const N of graphNodes){
+    if(hiddenTypes.has(N.type)) continue;
+    const dx=p.x-N.x, dy=p.y-N.y, d=Math.sqrt(dx*dx+dy*dy);
+    const rad = N.r/zoom + 4;
+    if(d < rad && d < bestD){ best=N; bestD=d; }
+  }
+  return best;
+}
+function onWheel(e){
+  e.preventDefault();
+  const rect = gcanvas.getBoundingClientRect();
+  const cx = e.clientX-rect.left-rect.width/2, cy = e.clientY-rect.top-rect.height/2;
+  const wx = (cx-panX)/zoom, wy = (cy-panY)/zoom;
+  const newZoom = Math.min(4, Math.max(0.2, zoom * (e.deltaY<0 ? 1.1 : 0.9)));
+  panX = cx - wx*newZoom; panY = cy - wy*newZoom; zoom = newZoom;
+  requestRender();
+}
+function onMouseDown(e){
+  const hit = hitTest(e.clientX, e.clientY);
+  dragged = false;
+  if(hit){ dragNode = hit; hit.dragging = true; settled = false; wakeSim(); }
+  else { panning = true; gcanvas.classList.add('dragging'); }
+  lastMouse = {x:e.clientX, y:e.clientY};
+}
+function onMouseMove(e){
+  if(dragNode){
+    const p = toWorld(e.clientX, e.clientY);
+    dragNode.x = p.x; dragNode.y = p.y; dragged = true;
+    requestRender();
+  } else if(panning){
+    panX += e.clientX-lastMouse.x; panY += e.clientY-lastMouse.y;
+    lastMouse = {x:e.clientX, y:e.clientY}; dragged = true;
+    requestRender();
+  } else if(activeTab==='graph' && gctx){
+    const hit = hitTest(e.clientX, e.clientY);
+    if(hit!==hoverNode){ hoverNode = hit; requestRender(); }
+  }
+}
+function onMouseUp(){
+  if(dragNode){ dragNode.dragging = false; dragNode = null; }
+  panning = false; gcanvas && gcanvas.classList.remove('dragging');
+}
+function onClick(e){
+  if(dragged) return;
+  const hit = hitTest(e.clientX, e.clientY);
+  if(hit) setHash({tab:'doc', page:hit.id});
+}
+
+/* ---------------- tabs ---------------- */
+document.getElementById('tab-doc').addEventListener('click', ()=>setHash({tab:'doc'}));
+document.getElementById('tab-graph').addEventListener('click', ()=>setHash({tab:'graph'}));
+
+/* ---------------- router render ---------------- */
+function renderFromHash(initial){
+  const h = parseHash();
+  activeTab = h.tab || 'doc';
+  document.getElementById('tab-doc').classList.toggle('active', activeTab==='doc');
+  document.getElementById('tab-graph').classList.toggle('active', activeTab==='graph');
+  document.getElementById('view-doc').style.display = activeTab==='doc' ? 'flex' : 'none';
+  document.getElementById('view-graph').style.display = activeTab==='graph' ? 'flex' : 'none';
+  if(activeTab==='doc'){
+    const page = h.page || 'index';
+    if(page !== currentPage || initial) loadDocPage(page);
+  } else {
+    ensureGraphInit();
+    if(graphNeedsReload || !graphInited){ reloadGraphFull(); graphNeedsReload=false; }
+    else { resizeGraphCanvas(); requestRender(); }
+  }
+  if(initial && h.live==='1') setLiveOpen(true);
+}
+window.addEventListener('hashchange', ()=>renderFromHash(false));
+
+/* ---------------- init ---------------- */
+async function init(){
+  await Promise.all([refreshTree(), refreshStatus()]);
+  connectSSE();
+  renderFromHash(true);
+  setInterval(refreshChips, 5000);
+}
+window.addEventListener('DOMContentLoaded', init);
+})();
+</script>
+</body>
+</html>

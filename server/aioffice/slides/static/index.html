@@ -1,0 +1,863 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>슬라이드 스튜디오</title>
+<style>
+  :root {
+    --accent: #1a56db;
+    --accent-tint: #eaf1fd;
+    --ink: #151515;
+    --body: #30343b;
+    --muted: #676b72;
+    --border: #d4d4d4;
+    --panel: #f4f4f4;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: 'Noto Sans KR', 'Malgun Gothic', sans-serif;
+    color: var(--body);
+    background: #e9e9e9;
+  }
+  #app { display: flex; flex-direction: row; height: 100vh; }
+
+  /* --- chat panel --- */
+  #chat-panel {
+    width: 400px; flex: 0 0 auto; display: flex; flex-direction: column;
+    background: #ffffff; border-right: 1px solid var(--border); padding: 16px; gap: 10px;
+    overflow: hidden;
+  }
+  #chat-head { flex: 0 0 auto; }
+  #chat-head h1 { font-size: 16px; margin: 0 0 2px; color: var(--ink); }
+  #topic-title { font-size: 13px; color: var(--muted); }
+  #model-name { font-size: 12px; color: var(--muted); }
+
+  #chat-log {
+    flex: 1; min-height: 60px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px; background: #fafafa;
+  }
+  .chat-msg { font-size: 13px; padding: 6px 8px; border-radius: 6px; background: var(--accent-tint); align-self: flex-end; max-width: 90%; }
+  .chat-note { font-size: 12px; color: var(--muted); padding: 2px 4px; }
+
+  #reasoning-box {
+    flex: 0 0 auto; display: none; border: 1px solid var(--border); border-radius: 6px; background: #fafafa;
+    max-height: 140px; overflow: hidden;
+  }
+  #reasoning-header {
+    display: flex; justify-content: space-between; align-items: center; padding: 6px 8px;
+    font-size: 12px; color: var(--muted); cursor: pointer; background: var(--panel);
+  }
+  #reasoning-text {
+    font-size: 12px; color: var(--muted); padding: 6px 8px; max-height: 100px; overflow-y: auto;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  #reasoning-box.collapsed #reasoning-text { display: none; }
+
+  #status-line { flex: 0 0 auto; font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
+
+  #chat-input-row { flex: 0 0 auto; display: flex; gap: 6px; }
+  #chat-input {
+    flex: 1; resize: none; height: 44px; border: 1px solid var(--border); border-radius: 6px;
+    padding: 8px; font-size: 13px; font-family: inherit;
+  }
+  button {
+    font-family: inherit; font-size: 13px; border: 1px solid var(--border); background: #fff;
+    border-radius: 6px; padding: 8px 10px; cursor: pointer; color: var(--ink);
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover:not(:disabled) { opacity: 0.9; color: #fff; }
+
+  #chat-buttons { flex: 0 0 auto; display: flex; gap: 6px; flex-wrap: wrap; }
+
+  /* --- stage panel --- */
+  #stage-panel { flex: 1; min-width: 0; display: flex; flex-direction: column; padding: 16px; gap: 10px; }
+  #stage-frame {
+    position: relative; width: 100%; aspect-ratio: 1920 / 1080; overflow: hidden;
+    background: #ffffff; border: 1px solid var(--border); border-radius: 6px; flex: 0 0 auto;
+  }
+  .empty-stage {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 20px;
+  }
+  .slide-canvas [data-path] { outline: none; cursor: text; }
+  .slide-canvas [data-path]:hover { background: rgba(26, 86, 219, 0.06); }
+  .slide-canvas [data-path]:focus { background: rgba(26, 86, 219, 0.10); }
+  .slide-canvas [data-path].overflow { outline: 1px dashed var(--accent); outline-offset: 2px; }
+
+  #warnings-list { flex: 0 0 auto; display: flex; flex-direction: column; gap: 4px; max-height: 90px; overflow-y: auto; }
+  .warning-item { font-size: 12px; color: #92400e; background: #fef3c7; border-radius: 4px; padding: 4px 8px; }
+
+  #thumb-strip { flex: 0 0 auto; display: flex; flex-direction: row; gap: 10px; overflow-x: auto; padding: 4px 2px; }
+  .thumb { border-radius: 4px; transition: box-shadow 0.2s; }
+  .thumb.flash { box-shadow: 0 0 0 3px var(--accent); }
+  .thumb-skeleton { border-radius: 4px; background: repeating-linear-gradient(45deg, #f0f0f0 0, #f0f0f0 6px, #e4e4e4 6px, #e4e4e4 12px); animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 0.6; } 50% { opacity: 1; } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="chat-panel">
+    <div id="chat-head">
+      <h1>슬라이드 스튜디오</h1>
+      <div id="topic-title"></div>
+      <div id="model-name"></div>
+    </div>
+    <div id="chat-log"></div>
+    <div id="reasoning-box" class="collapsed">
+      <div id="reasoning-header"><span>생각 중…</span><span id="elapsed">0.0초</span></div>
+      <div id="reasoning-text"></div>
+    </div>
+    <div id="status-line"><span id="done-summary"></span></div>
+    <div id="chat-input-row">
+      <textarea id="chat-input" placeholder="예: 2번 슬라이드 제목 줄여줘"></textarea>
+      <button id="send-btn" class="primary">보내기</button>
+    </div>
+    <div id="chat-buttons">
+      <button id="regen-btn">새로 생성</button>
+      <button id="undo-btn" disabled>되돌리기</button>
+      <button id="export-btn">PPTX 내보내기</button>
+      <button id="cancel-btn" style="display:none">중단</button>
+    </div>
+  </div>
+  <div id="stage-panel">
+    <div id="stage-frame"><div class="empty-stage">불러오는 중…</div></div>
+    <div id="warnings-list"></div>
+    <div id="thumb-strip"></div>
+  </div>
+</div>
+
+<script>
+'use strict';
+
+// --- design tokens (mirrors aioffice.slides.spec.TOKENS) -----------------------------------
+const TOKENS = {
+  ink: '#151515', body: '#30343b', muted: '#676b72', border: '#d4d4d4', panel: '#f4f4f4',
+  grayBars: ['#30343b', '#676b72', '#a8abb0', '#e1e2e4'],
+  accent: '#1a56db', accentTint: '#eaf1fd',
+};
+const NUMBERED = ['①', '②', '③', '④', '⑤'];
+
+const state = {
+  deck: { title: '', footer: '', slides: [] },
+  warnings: [],
+  selected: -1,
+  undoStack: [],
+  busy: false,
+  topicTitle: '',
+  model: '',
+};
+
+// --- tiny DOM builder ------------------------------------------------------------------------
+function el(tag, props, children) {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === undefined || v === null) continue;
+    if (k === 'style') Object.assign(node.style, v);
+    else if (k === 'class') node.className = v;
+    else node[k] = v;
+  }
+  (children || []).forEach((c) => {
+    if (c === null || c === undefined) return;
+    node.appendChild(typeof c === 'string' ? document.createTextNode(c) : c);
+  });
+  return node;
+}
+
+function forecastPattern(color) {
+  return `repeating-linear-gradient(45deg, ${color} 0, ${color} 3px, #ffffff 3px, #ffffff 8px)`;
+}
+
+// A block-level text field with a character limit gets a real height budget (maxLines worth
+// of its own line-height) so checkOverflow has something genuine to measure -- an unconstrained
+// auto-height element can never "overflow" since it just grows to fit its content.
+function clampBox(style, fontPx, lineHeight, maxLines) {
+  return Object.assign({}, style, {
+    lineHeight: String(lineHeight), // explicit, so checkOverflow's getComputedStyle read is deterministic
+    maxHeight: (fontPx * lineHeight * maxLines) + 'px',
+    overflow: 'hidden',
+  });
+}
+
+// --- path get/set into state.deck -------------------------------------------------------------
+function pathKey(k) { return /^\d+$/.test(k) ? Number(k) : k; }
+function getPath(obj, path) {
+  return path.split('.').reduce((o, k) => (o == null ? undefined : o[pathKey(k)]), obj);
+}
+function setPath(obj, path, value) {
+  const keys = path.split('.');
+  let node = obj;
+  for (let i = 0; i < keys.length - 1; i++) node = node[pathKey(keys[i])];
+  node[pathKey(keys[keys.length - 1])] = value;
+}
+function parseNumber(text) {
+  const cleaned = String(text).trim().replace(/,/g, '').replace(/^\$/, '').replace(/%$/, '');
+  const n = Number(cleaned);
+  return Number.isFinite(n) && cleaned !== '' ? n : null;
+}
+
+// --- click-to-edit ------------------------------------------------------------------------
+function onFieldBlur(node, opts) {
+  const path = node.getAttribute('data-path');
+  const raw = node.textContent;
+  let value = raw;
+  if (opts.number) {
+    const n = parseNumber(raw);
+    if (n === null) { node.textContent = String(getPath(state.deck, path)); return; }
+    value = n;
+  }
+  const current = getPath(state.deck, path);
+  if (current === value) return;
+  pushUndo();
+  setPath(state.deck, path, value);
+  renderAll();
+  saveDeck();
+}
+
+function makeEditable(node, path, opts) {
+  node.setAttribute('contenteditable', 'true');
+  node.setAttribute('data-path', path);
+  node.addEventListener('blur', () => onFieldBlur(node, opts || {}));
+  node.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); node.blur(); } });
+  return node;
+}
+
+function editableOrText(tag, path, text, style, editable, opts) {
+  const node = el(tag, { style });
+  node.textContent = text === undefined || text === null ? '' : String(text);
+  return editable ? makeEditable(node, path, opts) : node;
+}
+
+// --- panels: bar / stacked / dots / table --------------------------------------------------
+function panelHeader(panel, path, editable) {
+  const box = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '2px', flex: '0 0 auto' } });
+  box.appendChild(editableOrText('p', `${path}.title`, panel.title, clampBox({ fontSize: '24px', fontWeight: '700', color: TOKENS.ink, margin: '0' }, 24, 1.3, 2), editable));
+  if (panel.caption !== undefined) {
+    box.appendChild(editableOrText('p', `${path}.caption`, panel.caption, clampBox({ fontSize: '24px', color: TOKENS.muted, margin: '0' }, 24, 1.3, 2), editable));
+  }
+  return box;
+}
+
+function renderBarPanel(panel, path, editable) {
+  const wrap = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', flex: '1', minHeight: '0' } });
+  wrap.appendChild(panelHeader(panel, path, editable));
+  const values = panel.values || [];
+  const maxVal = Math.max(1, ...values.map((v) => Math.abs(v)));
+  // The bars row fills whatever vertical space is left in the panel (flex:1, not a fixed
+  // px height) -- a fixed height overflowed into the panel title in a short (2-3 panel) layout.
+  const row = el('div', { style: { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'row', gap: '16px', borderBottom: `2px solid ${TOKENS.body}` } });
+  (panel.categories || []).forEach((cat, k) => {
+    const v = values[k] !== undefined ? values[k] : 0;
+    const isForecast = !!(panel.forecast && panel.forecast[k]);
+    const isHl = panel.highlight === k;
+    const heightPct = Math.max(3, (Math.abs(v) / maxVal) * 100);
+    const color = isHl ? TOKENS.accent : TOKENS.grayBars[0];
+    const col = el('div', { style: { display: 'flex', flexDirection: 'column', flex: '1 1 0', minWidth: '0' } });
+    col.appendChild(editableOrText('p', `${path}.values.${k}`, v, { fontSize: '24px', color: TOKENS.ink, margin: '0 0 4px', flex: '0 0 auto', textAlign: 'center' }, editable, { number: true }));
+    // barBox is the remaining flex space in the column; the bar itself is a % of THAT box, so
+    // it always lands exactly on the shared baseline regardless of panel height.
+    const barBox = el('div', { style: { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column', justifyContent: 'flex-end', alignItems: 'center' } });
+    barBox.appendChild(el('div', {
+      style: {
+        width: '70%', height: heightPct + '%',
+        background: isForecast ? forecastPattern(color) : color,
+        border: isForecast ? `1px solid ${color}` : 'none',
+      },
+    }));
+    col.appendChild(barBox);
+    // 20px + nowrap: never wrap mid-word ("C투자증권" etc. must stay on one line). With many
+    // narrow columns even 20px can be wider than the column -- fitLabelsToColumns() shrinks
+    // it further (via transform: scale, not a smaller font that would blur) after mounting.
+    const catLabel = editableOrText('p', `${path}.categories.${k}`, cat, { fontSize: '20px', color: TOKENS.body, margin: '4px 0 0', textAlign: 'center', whiteSpace: 'nowrap', flex: '0 0 auto' }, editable);
+    catLabel.classList.add('bar-cat-label');
+    col.appendChild(catLabel);
+    row.appendChild(col);
+  });
+  wrap.appendChild(row);
+  return wrap;
+}
+
+function renderStackedPanel(panel, path, editable) {
+  const wrap = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px', flex: '1', minHeight: '0', justifyContent: 'center' } });
+  wrap.appendChild(panelHeader(panel, path, editable));
+  (panel.rows || []).forEach((row, r) => {
+    const total = (row.parts || []).reduce((s, p) => s + (p.value || 0), 0) || 1;
+    const rowEl = el('div', { style: { display: 'flex', flexDirection: 'row', gap: '12px', alignItems: 'center', flex: '0 0 auto' } });
+    rowEl.appendChild(editableOrText('p', `${path}.rows.${r}.label`, row.label, { width: '80px', flex: '0 0 auto', fontSize: '24px', fontWeight: '700', color: TOKENS.ink, margin: '0' }, editable));
+    const bar = el('div', { style: { display: 'flex', flexDirection: 'row', flex: '1', height: '64px', overflow: 'hidden' } });
+    (row.parts || []).forEach((part, p) => {
+      const isHl = panel.highlight === part.name;
+      const w = (part.value / total) * 100;
+      const color = isHl ? TOKENS.accent : TOKENS.grayBars[p % TOKENS.grayBars.length];
+      const seg = el('div', { style: { width: w + '%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '4px', background: color } });
+      seg.appendChild(editableOrText('span', `${path}.rows.${r}.parts.${p}.name`, part.name, { fontSize: '24px', color: _labelColorOn(color) }, editable));
+      seg.appendChild(editableOrText('span', `${path}.rows.${r}.parts.${p}.value`, part.value, { fontSize: '24px', color: _labelColorOn(color) }, editable, { number: true }));
+      bar.appendChild(seg);
+    });
+    rowEl.appendChild(bar);
+    wrap.appendChild(rowEl);
+  });
+  return wrap;
+}
+
+// White text on the dark fills (accent, the two darker gray bars), ink on the light ones.
+function _labelColorOn(fillColor) {
+  return (fillColor === TOKENS.accent || fillColor === TOKENS.grayBars[0] || fillColor === TOKENS.grayBars[1])
+    ? '#ffffff' : TOKENS.ink;
+}
+
+function renderDotsPanel(panel, path, editable) {
+  const wrap = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '10px', flex: '1', minHeight: '0' } });
+  wrap.appendChild(panelHeader(panel, path, editable));
+  const items = panel.items || [];
+  const values = items.map((it) => it.value);
+  const min = Math.min(0, ...values, 0);
+  const max = Math.max(...values, min + 1);
+  // Each row is flex:1 with a hard min-height -- flexbox spreads n rows evenly across
+  // whatever height the panel has, with no scrollbar (fills or grows, never scrolls).
+  const list = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px', flex: '1', minHeight: '0' } });
+  items.forEach((item, k) => {
+    const isHl = panel.highlight === item.label;
+    const pct = max > min ? ((item.value - min) / (max - min)) * 100 : 0;
+    const row = el('div', { style: { display: 'flex', flexDirection: 'row', gap: '12px', alignItems: 'center', flex: '1', minHeight: '28px' } });
+    row.appendChild(editableOrText('p', `${path}.items.${k}.label`, item.label, { width: '150px', flex: '0 0 auto', fontSize: '24px', color: TOKENS.ink, margin: '0', whiteSpace: 'nowrap' }, editable));
+    const track = el('div', { style: { position: 'relative', flex: '1', height: '2px', background: TOKENS.border } });
+    const dot = el('div', { style: { position: 'absolute', left: `calc(${pct}% - 8px)`, top: '-7px', width: '16px', height: '16px', borderRadius: '50%', background: isHl ? TOKENS.accent : TOKENS.grayBars[1] } });
+    track.appendChild(dot);
+    row.appendChild(track);
+    row.appendChild(editableOrText('p', `${path}.items.${k}.value`, item.value, { width: '60px', flex: '0 0 auto', fontSize: '24px', color: TOKENS.ink, margin: '0', textAlign: 'right' }, editable, { number: true }));
+    list.appendChild(row);
+  });
+  wrap.appendChild(list);
+  return wrap;
+}
+
+function renderTablePanel(panel, path, editable) {
+  const wrap = el('div', { style: { flex: '1', minHeight: '0', overflow: 'auto' } });
+  const table = el('table', { style: { borderCollapse: 'collapse', width: '100%' } });
+  const columns = panel.columns || [];
+  const thead = el('tr');
+  columns.forEach((col, c) => {
+    const th = el('th', { style: { textAlign: 'left', padding: '8px 10px', background: TOKENS.panel, border: `1px solid ${TOKENS.border}`, fontSize: '24px', fontWeight: '700', color: TOKENS.ink } });
+    th.appendChild(editableOrText('span', `${path}.columns.${c}`, col, {}, editable));
+    thead.appendChild(th);
+  });
+  table.appendChild(thead);
+  (panel.rows || []).forEach((row, r) => {
+    const isHl = (panel.highlight_rows || []).includes(r);
+    const tr = el('tr', { style: { background: isHl ? TOKENS.accentTint : '#ffffff' } });
+    row.forEach((cell, c) => {
+      const td = el('td', { style: { padding: '8px 10px', border: `1px solid ${TOKENS.border}`, fontSize: '24px', color: TOKENS.body } });
+      td.appendChild(editableOrText('span', `${path}.rows.${r}.${c}`, cell, {}, editable));
+      tr.appendChild(td);
+    });
+    table.appendChild(tr);
+  });
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function renderPanel(panel, path, editable) {
+  const outer = el('div', { class: 'panel-box', style: { display: 'flex', flexDirection: 'column', gap: '12px', padding: '16px 20px', background: '#ffffff', border: `1px solid ${TOKENS.border}`, flex: '1', minHeight: '0', minWidth: '0' } });
+  let inner;
+  if (panel.type === 'bar') inner = renderBarPanel(panel, path, editable);
+  else if (panel.type === 'stacked') inner = renderStackedPanel(panel, path, editable);
+  else if (panel.type === 'dots') inner = renderDotsPanel(panel, path, editable);
+  else if (panel.type === 'table') inner = renderTablePanel(panel, path, editable);
+  else inner = el('div', {}, ['(알 수 없는 패널)']);
+  outer.appendChild(inner);
+  return outer;
+}
+
+function renderPanelsColumn(panels, pathPrefix, editable) {
+  const col = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '16px', flex: '1', minHeight: '0', minWidth: '0' } });
+  if (panels.length <= 2) {
+    panels.forEach((p, j) => col.appendChild(renderPanel(p, `${pathPrefix}.panels.${j}`, editable)));
+  } else {
+    const top = el('div', { style: { display: 'flex', flexDirection: 'row', gap: '16px', flex: '1', minHeight: '0' } });
+    top.appendChild(renderPanel(panels[0], `${pathPrefix}.panels.0`, editable));
+    top.appendChild(renderPanel(panels[1], `${pathPrefix}.panels.1`, editable));
+    col.appendChild(top);
+    col.appendChild(renderPanel(panels[2], `${pathPrefix}.panels.2`, editable));
+  }
+  return col;
+}
+
+// --- header / footer -------------------------------------------------------------------------
+function buildHeadlineWithHighlight(path, text, highlight, editable) {
+  const p = el('p', { style: clampBox({ fontSize: '28px', fontWeight: '700', color: TOKENS.ink, margin: '0' }, 28, 1.35, 3) });
+  const idx = highlight ? String(text || '').indexOf(highlight) : -1;
+  if (idx === -1) {
+    p.textContent = text || '';
+  } else {
+    p.appendChild(document.createTextNode(text.slice(0, idx)));
+    const span = el('span', { style: { color: TOKENS.accent } });
+    span.textContent = text.slice(idx, idx + highlight.length);
+    p.appendChild(span);
+    p.appendChild(document.createTextNode(text.slice(idx + highlight.length)));
+  }
+  return editable ? makeEditable(p, path, {}) : p;
+}
+
+function buildHeader(slide, i, editable) {
+  const wrap = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '8px', minHeight: '172px', flex: '0 0 auto' } });
+  wrap.appendChild(editableOrText('p', `slides.${i}.kicker`, slide.kicker, clampBox({ fontSize: '24px', fontWeight: '600', letterSpacing: '1px', color: TOKENS.accent, margin: '0' }, 24, 1.2, 2), editable));
+  wrap.appendChild(editableOrText('h2', `slides.${i}.title`, slide.title, clampBox({ fontSize: '56px', fontWeight: '700', lineHeight: '1.15', color: TOKENS.ink, margin: '0' }, 56, 1.15, 2), editable));
+  if (slide.subtitle) {
+    wrap.appendChild(editableOrText('p', `slides.${i}.subtitle`, slide.subtitle, clampBox({ fontSize: '32px', color: TOKENS.body, margin: '0' }, 32, 1.4, 2), editable));
+  }
+  return wrap;
+}
+
+function buildFooter(slide, i, editable) {
+  const wrap = el('div', { style: { position: 'absolute', bottom: '22px', left: '64px', width: '1792px', display: 'flex', flexDirection: 'row', gap: '6px', fontSize: '24px', color: TOKENS.muted } });
+  wrap.appendChild(editableOrText('span', 'footer', state.deck.footer, {}, editable));
+  if (slide.source) {
+    wrap.appendChild(document.createTextNode(' · '));
+    wrap.appendChild(editableOrText('span', `slides.${i}.source`, slide.source, {}, editable));
+  }
+  return wrap;
+}
+
+// --- layouts --------------------------------------------------------------------------------
+function buildNumberedRow(num, keywordPath, keyword, textPath, text, editable) {
+  const row = el('div', { style: { display: 'flex', flexDirection: 'row', gap: '8px' } });
+  row.appendChild(el('p', { style: { width: '30px', flex: '0 0 auto', fontSize: '24px', fontWeight: '700', color: TOKENS.accent, margin: '0' } }, [num]));
+  const textWrap = el('p', { style: { flex: '1', fontSize: '24px', color: TOKENS.body, margin: '0' } });
+  textWrap.appendChild(editableOrText('span', keywordPath, keyword, { fontWeight: '700' }, editable));
+  textWrap.appendChild(document.createTextNode(' '));
+  textWrap.appendChild(editableOrText('span', textPath, text, {}, editable));
+  row.appendChild(textWrap);
+  return row;
+}
+
+function buildSummaryBody(slide, i, editable) {
+  const left = el('div', { style: { width: '600px', flex: '0 0 auto', display: 'flex', flexDirection: 'column', gap: '12px', minHeight: '0', overflow: 'auto' } });
+  const j = slide.judgment || {};
+  const callout = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px', padding: '14px 20px', background: TOKENS.accentTint, borderLeft: `4px solid ${TOKENS.accent}`, flex: '0 0 auto' } });
+  callout.appendChild(el('p', { style: { fontSize: '24px', fontWeight: '600', color: TOKENS.accent, margin: '0' } }, ['판단']));
+  callout.appendChild(buildHeadlineWithHighlight(`slides.${i}.judgment.headline`, j.headline, j.highlight, editable));
+  callout.appendChild(editableOrText('p', `slides.${i}.judgment.detail`, j.detail, clampBox({ fontSize: '24px', color: TOKENS.body, margin: '0' }, 24, 1.45, 3), editable));
+  left.appendChild(callout);
+
+  const evidenceBox = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', flex: '0 0 auto' } });
+  evidenceBox.appendChild(el('p', { style: { fontSize: '24px', fontWeight: '600', color: TOKENS.muted, margin: '0' } }, ['근거']));
+  (slide.evidence || []).forEach((item, k) => {
+    evidenceBox.appendChild(buildNumberedRow(
+      NUMBERED[k] || String(k + 1),
+      `slides.${i}.evidence.${k}.keyword`, item.keyword,
+      `slides.${i}.evidence.${k}.text`, item.text, editable));
+  });
+  left.appendChild(evidenceBox);
+
+  const implicationBox = el('div', { style: { display: 'flex', flexDirection: 'column', gap: '6px', flex: '0 0 auto' } });
+  implicationBox.appendChild(el('p', { style: { fontSize: '24px', fontWeight: '600', color: TOKENS.muted, margin: '0' } }, ['시사점']));
+  implicationBox.appendChild(editableOrText('p', `slides.${i}.implication.text`, (slide.implication || {}).text, clampBox({ fontSize: '24px', color: TOKENS.body, margin: '0' }, 24, 1.45, 3), editable));
+  const actionRow = el('p', { style: { fontSize: '24px', fontWeight: '700', color: TOKENS.accent, margin: '0' } });
+  actionRow.appendChild(document.createTextNode('→ '));
+  actionRow.appendChild(editableOrText('span', `slides.${i}.implication.action`, (slide.implication || {}).action, {}, editable));
+  implicationBox.appendChild(actionRow);
+  left.appendChild(implicationBox);
+
+  const right = renderPanelsColumn(slide.panels || [], `slides.${i}`, editable);
+  const row = el('div', { style: { display: 'flex', flexDirection: 'row', gap: '24px', flex: '1', minHeight: '0' } });
+  row.appendChild(left);
+  row.appendChild(right);
+  return row;
+}
+
+function buildTableBody(slide, i, editable) {
+  const wrap = el('div', { style: { flex: '1', minHeight: '0', display: 'flex', flexDirection: 'column', gap: '12px' } });
+  const table = slide.table || { columns: [], rows: [] };
+  wrap.appendChild(editableOrText('p', `slides.${i}.table.title`, table.title, clampBox({ fontSize: '24px', fontWeight: '700', color: TOKENS.ink, margin: '0' }, 24, 1.3, 2), editable));
+  wrap.appendChild(renderTablePanel(table, `slides.${i}.table`, editable));
+  if (slide.note) {
+    wrap.appendChild(editableOrText('p', `slides.${i}.note`, slide.note, clampBox({ fontSize: '24px', color: TOKENS.muted, margin: '0' }, 24, 1.3, 2), editable));
+  }
+  return wrap;
+}
+
+function buildChartBody(slide, i, editable) {
+  const row = el('div', { style: { display: 'flex', flexDirection: 'row', gap: '24px', flex: '1', minHeight: '0' } });
+  const chartBox = el('div', { style: { width: '1200px', flex: '0 0 auto', minHeight: '0', display: 'flex' } });
+  chartBox.appendChild(renderPanel(slide.chart || { type: 'bar', categories: [], values: [] }, `slides.${i}.chart`, editable));
+  row.appendChild(chartBox);
+  const notes = el('div', { style: { flex: '1', display: 'flex', flexDirection: 'column', gap: '16px', minHeight: '0', minWidth: '0' } });
+  (slide.notes || []).forEach((note, k) => {
+    notes.appendChild(buildNumberedRow(
+      NUMBERED[k] || String(k + 1),
+      `slides.${i}.notes.${k}.keyword`, note.keyword,
+      `slides.${i}.notes.${k}.text`, note.text, editable));
+  });
+  row.appendChild(notes);
+  return row;
+}
+
+function buildSlideCanvas(slide, i, editable) {
+  const canvas = el('div', {
+    class: 'slide-canvas',
+    style: {
+      width: '1920px', height: '1080px', background: '#ffffff', display: 'flex',
+      flexDirection: 'column', gap: '24px', padding: '104px 64px 160px', boxSizing: 'border-box',
+      fontFamily: "'Noto Sans KR','Malgun Gothic',sans-serif", overflow: 'hidden', position: 'relative',
+    },
+  });
+  canvas.appendChild(buildHeader(slide, i, editable));
+  canvas.appendChild(el('div', { style: { height: '2px', background: TOKENS.ink, flex: '0 0 auto' } }));
+  if (slide.layout === 'summary') canvas.appendChild(buildSummaryBody(slide, i, editable));
+  else if (slide.layout === 'table') canvas.appendChild(buildTableBody(slide, i, editable));
+  else if (slide.layout === 'chart') canvas.appendChild(buildChartBody(slide, i, editable));
+  canvas.appendChild(buildFooter(slide, i, editable));
+  return canvas;
+}
+
+// --- overflow flag (dashed outline for text that busts its box) ----------------------------
+function checkOverflow(root) {
+  // Tolerance scales with each element's own line-height (half a line), not a fixed px
+  // value: different fonts (Malgun Gothic vs. a fallback on a machine that lacks it) round
+  // line-box metrics differently by a few px even with no real overflow, and that noise is
+  // a fixed handful of px regardless of font size -- a flat threshold is either too loose for
+  // small text or too tight for large text. Only unconstrained-height elements (no clampBox)
+  // never overflow, which is fine: their fields are already covered by the length warnings.
+  root.querySelectorAll('[data-path]').forEach((node) => {
+    const lineHeightPx = parseFloat(getComputedStyle(node).lineHeight) || 20;
+    node.classList.toggle('overflow', (node.scrollHeight - node.clientHeight) > lineHeightPx * 0.5);
+  });
+}
+
+// Bar-chart category labels sit in narrow flex columns (up to 8 institutions in one panel) --
+// 20px nowrap text can still be wider than its column (e.g. "C투자증권"), which without this
+// collides with the neighboring label. Shrink via transform: scale (never wrap/cut) so the
+// glyphs stay crisp instead of blurring from a smaller font-size relayout.
+function fitLabelsToColumns(root) {
+  root.querySelectorAll('.bar-cat-label').forEach((label) => {
+    label.style.transform = 'none';
+    const colWidth = label.parentElement.clientWidth;
+    const natural = label.scrollWidth;
+    if (colWidth > 0 && natural > colWidth) {
+      label.style.transform = `scale(${Math.max(0.55, colWidth / natural)})`;
+    }
+  });
+}
+
+// --- stage / thumbnails -----------------------------------------------------------------
+const stageFrame = document.getElementById('stage-frame');
+let currentCanvas = null;
+
+function applyStageScale() {
+  if (!currentCanvas) return;
+  const rect = stageFrame.getBoundingClientRect();
+  const scale = Math.min(rect.width / 1920, rect.height / 1080);
+  currentCanvas.style.transform = `scale(${scale})`;
+  currentCanvas.style.transformOrigin = 'top left';
+}
+new ResizeObserver(applyStageScale).observe(stageFrame);
+
+function renderStage() {
+  const slide = state.deck.slides[state.selected];
+  stageFrame.innerHTML = '';
+  if (!slide) {
+    stageFrame.appendChild(el('div', { class: 'empty-stage' }, ['아직 슬라이드가 없습니다. 채팅으로 생성하세요.']));
+    currentCanvas = null;
+    renderWarningsList();
+    return;
+  }
+  const canvas = buildSlideCanvas(slide, state.selected, true);
+  canvas.style.position = 'absolute';
+  canvas.style.top = '0';
+  canvas.style.left = '0';
+  currentCanvas = canvas;
+  stageFrame.appendChild(canvas);
+  applyStageScale();
+  // Reading scrollHeight/clientHeight forces layout synchronously -- no need to wait for a
+  // paint frame (and rAF is throttled/paused for a backgrounded tab, which would silently
+  // skip this check).
+  checkOverflow(canvas);
+  fitLabelsToColumns(canvas);
+  renderWarningsList();
+}
+
+function renderWarningsList() {
+  const box = document.getElementById('warnings-list');
+  box.innerHTML = '';
+  (state.warnings[state.selected] || []).forEach((w) => {
+    box.appendChild(el('div', { class: 'warning-item' }, [w]));
+  });
+}
+
+const THUMB_W = 168, THUMB_H = 94.5;
+
+function buildThumbnail(slide, idx) {
+  const frame = el('div', {
+    class: 'thumb', style: {
+      position: 'relative', width: THUMB_W + 'px', height: THUMB_H + 'px', overflow: 'hidden',
+      border: idx === state.selected ? `2px solid ${TOKENS.accent}` : `1px solid ${TOKENS.border}`,
+      cursor: 'pointer', flex: '0 0 auto', background: '#fff',
+    },
+  });
+  const canvas = buildSlideCanvas(slide, idx, false);
+  canvas.style.position = 'absolute';
+  canvas.style.top = '0';
+  canvas.style.left = '0';
+  canvas.style.transform = `scale(${THUMB_W / 1920})`;
+  canvas.style.transformOrigin = 'top left';
+  canvas.style.pointerEvents = 'none';
+  frame.appendChild(canvas);
+  const warns = state.warnings[idx] || [];
+  if (warns.length) {
+    frame.appendChild(el('div', {
+      style: {
+        position: 'absolute', top: '2px', right: '2px', background: TOKENS.accent, color: '#fff',
+        fontSize: '10px', borderRadius: '8px', padding: '0 5px', lineHeight: '14px',
+      },
+    }, [String(warns.length)]));
+  }
+  frame.addEventListener('click', () => selectSlide(idx));
+  return frame;
+}
+
+function renderThumbnails() {
+  const strip = document.getElementById('thumb-strip');
+  strip.innerHTML = '';
+  state.deck.slides.forEach((slide, idx) => strip.appendChild(buildThumbnail(slide, idx)));
+  if (state.busy) {
+    strip.appendChild(el('div', { class: 'thumb-skeleton', style: { width: THUMB_W + 'px', height: THUMB_H + 'px' } }));
+  }
+}
+
+function selectSlide(idx) {
+  if (idx < 0 || idx >= state.deck.slides.length) return;
+  state.selected = idx;
+  history.replaceState(null, '', `#slide=${idx + 1}`);
+  renderAll();
+}
+
+// #slide=N (1-based) selects a slide on load, so a single slide can be linked or
+// screenshotted headlessly.
+function slideIndexFromHash() {
+  const match = /slide=(\d+)/.exec(location.hash);
+  return match ? parseInt(match[1], 10) - 1 : null;
+}
+
+function flashSlide(idx) {
+  requestAnimationFrame(() => {
+    const thumb = document.querySelectorAll('.thumb')[idx];
+    if (!thumb) return;
+    thumb.classList.add('flash');
+    setTimeout(() => thumb.classList.remove('flash'), 600);
+  });
+}
+
+function renderAll() {
+  renderStage();
+  renderThumbnails();
+  updateUndoButton();
+}
+
+// --- undo / save -----------------------------------------------------------------------------
+function pushUndo() {
+  state.undoStack.push(JSON.parse(JSON.stringify(state.deck)));
+  if (state.undoStack.length > 50) state.undoStack.shift();
+  updateUndoButton();
+}
+function updateUndoButton() {
+  document.getElementById('undo-btn').disabled = state.undoStack.length === 0;
+}
+function undo() {
+  if (!state.undoStack.length) return;
+  state.deck = state.undoStack.pop();
+  renderAll();
+  saveDeck();
+}
+async function saveDeck() {
+  try {
+    const res = await fetch('/api/deck', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(state.deck) });
+    const data = await res.json();
+    if (!res.ok) { appendChatNote(data.error || '저장 실패'); return; }
+    state.deck = data.deck;
+    state.warnings = data.warnings;
+    renderAll();
+  } catch (err) {
+    appendChatNote('저장 오류: ' + err.message);
+  }
+}
+
+// --- chat / SSE streaming -----------------------------------------------------------------
+function appendChatMessage(role, text) {
+  const log = document.getElementById('chat-log');
+  log.appendChild(el('div', { class: 'chat-msg chat-' + role }, [text]));
+  log.scrollTop = log.scrollHeight;
+}
+function appendChatNote(text) {
+  const log = document.getElementById('chat-log');
+  log.appendChild(el('div', { class: 'chat-note' }, [text]));
+  log.scrollTop = log.scrollHeight;
+}
+
+const reasoningBox = document.getElementById('reasoning-box');
+const reasoningText = document.getElementById('reasoning-text');
+document.getElementById('reasoning-header').addEventListener('click', () => {
+  reasoningBox.classList.toggle('collapsed');
+});
+function showReasoningBox() {
+  reasoningBox.style.display = 'block';
+  reasoningBox.classList.remove('collapsed');
+  reasoningText.textContent = '';
+}
+function appendReasoning(text) {
+  reasoningText.textContent += text;
+  reasoningText.scrollTop = reasoningText.scrollHeight;
+}
+function collapseReasoningBox() {
+  reasoningBox.classList.add('collapsed');
+}
+
+let elapsedTimer = null;
+function resetElapsedTimer() {
+  const start = Date.now();
+  clearInterval(elapsedTimer);
+  document.getElementById('elapsed').textContent = '0.0초';
+  elapsedTimer = setInterval(() => {
+    document.getElementById('elapsed').textContent = ((Date.now() - start) / 1000).toFixed(1) + '초';
+  }, 200);
+}
+function stopElapsedTimer() { clearInterval(elapsedTimer); }
+
+function showDoneSummary(payload) {
+  const line = `출력 ${Number(payload.completion_tokens || 0).toLocaleString()}토큰 · ${payload.seconds}초 · 사내 환산 약 ${payload.internal_estimate_seconds}초`;
+  document.getElementById('done-summary').textContent = line;
+  appendChatNote(line);
+}
+
+function setBusy(v) {
+  state.busy = v;
+  document.getElementById('send-btn').disabled = v;
+  document.getElementById('regen-btn').disabled = v;
+  document.getElementById('cancel-btn').style.display = v ? 'inline-block' : 'none';
+  renderThumbnails();
+}
+
+function applyStreamedOp(op) {
+  const slides = state.deck.slides;
+  if (op.op === 'insert') {
+    const idx = Math.max(0, Math.min(op.index, slides.length));
+    slides.splice(idx, 0, op.slide);
+    state.warnings.splice(idx, 0, op.warnings || []);
+    state.selected = idx;
+  } else if (op.op === 'replace' && op.index >= 0 && op.index < slides.length) {
+    slides[op.index] = op.slide;
+    state.warnings[op.index] = op.warnings || [];
+    state.selected = op.index;
+  } else if (op.op === 'delete' && op.index >= 0 && op.index < slides.length) {
+    slides.splice(op.index, 1);
+    state.warnings.splice(op.index, 1);
+    if (state.selected >= slides.length) state.selected = Math.max(0, slides.length - 1);
+  }
+  renderAll();
+  flashSlide(state.selected);
+}
+
+function handleSseBlock(raw) {
+  let eventType = 'message';
+  let data = '';
+  raw.split('\n').forEach((line) => {
+    if (line.startsWith('event:')) eventType = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).trim();
+  });
+  if (!data) return;
+  let payload;
+  try { payload = JSON.parse(data); } catch (e) { return; }
+  if (eventType === 'reasoning') appendReasoning(payload.text);
+  else if (eventType === 'op') { applyStreamedOp(payload); collapseReasoningBox(); }
+  else if (eventType === 'warning') appendChatNote('경고: ' + payload.text);
+  else if (eventType === 'error') appendChatNote('오류: ' + payload.text);
+  else if (eventType === 'done') showDoneSummary(payload);
+}
+
+async function streamOps(url, body) {
+  if (state.busy) return;
+  setBusy(true);
+  showReasoningBox();
+  resetElapsedTimer();
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    if (res.status === 409) {
+      const err = await res.json().catch(() => ({}));
+      appendChatNote(err.error || '생성 중입니다');
+      return;
+    }
+    if (!res.ok || !res.body) {
+      appendChatNote('생성 요청 실패');
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) !== -1) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        handleSseBlock(raw);
+      }
+    }
+  } catch (err) {
+    appendChatNote('연결 오류: ' + err.message);
+  } finally {
+    stopElapsedTimer();
+    setBusy(false);
+  }
+}
+
+async function sendChat() {
+  if (state.busy) return;
+  const input = document.getElementById('chat-input');
+  const text = input.value.trim();
+  if (state.deck.slides.length === 0) {
+    appendChatMessage('user', text || '(덱 생성 요청)');
+    input.value = '';
+    await streamOps('/api/generate', { slides: 3 });
+    return;
+  }
+  if (!text) return;
+  appendChatMessage('user', text);
+  input.value = '';
+  await streamOps('/api/edit', { instruction: text, selected: state.selected });
+}
+
+document.getElementById('send-btn').addEventListener('click', sendChat);
+document.getElementById('chat-input').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
+});
+document.getElementById('regen-btn').addEventListener('click', () => streamOps('/api/generate', { slides: 3 }));
+document.getElementById('undo-btn').addEventListener('click', undo);
+document.getElementById('export-btn').addEventListener('click', () => { window.location.href = '/api/export.pptx'; });
+document.getElementById('cancel-btn').addEventListener('click', () => { fetch('/api/cancel', { method: 'POST' }); });
+
+// --- boot -----------------------------------------------------------------------------------
+async function loadState() {
+  const res = await fetch('/api/state');
+  const data = await res.json();
+  state.deck = data.deck;
+  state.warnings = data.warnings;
+  state.topicTitle = data.topic_title;
+  state.model = data.model;
+  state.busy = data.busy;
+  const fromHash = slideIndexFromHash();
+  state.selected = state.deck.slides.length
+    ? (fromHash !== null && fromHash >= 0 && fromHash < state.deck.slides.length ? fromHash : 0)
+    : -1;
+  document.getElementById('topic-title').textContent = state.topicTitle || '';
+  document.getElementById('model-name').textContent = state.model ? `모델: ${state.model}` : '(모델 미설정)';
+  renderAll();
+}
+window.addEventListener('DOMContentLoaded', loadState);
+</script>
+</body>
+</html>
