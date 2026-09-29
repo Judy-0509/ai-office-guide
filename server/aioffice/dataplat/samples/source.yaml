@@ -1,0 +1,6 @@
+# Example source.yaml matching samples/fake_source.py's fictional DB (used by the test suite
+# and the live-check). db is resolved relative to this file when it's not absolute.
+db: fake_source.sqlite
+view: v_dataplat_observations
+rename:
+  broker: source   # the view calls the column "broker" -- dataplat wants "source"

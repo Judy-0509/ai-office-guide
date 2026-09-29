@@ -25,6 +25,8 @@ include = ["aioffice*"]
 aioffice = [
   "schema.sql", "slides/static/*.html", "slides/samples/*.json",
   "analyst/static/*.html", "analyst/samples/reports/*.md",
+  "dataplat/schema.sql", "dataplat/static/*.html",
+  "dataplat/samples/*.yaml", "dataplat/samples/*.sql", "dataplat/clients/*.ts",
 ]
 
 [tool.pytest.ini_options]

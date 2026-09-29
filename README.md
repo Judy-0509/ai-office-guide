@@ -40,7 +40,10 @@
   100~200건에서 이번 주 핵심 주제와 주제 간 연관을 찾는 3가지 방법 비교
 - [`02-analyst-manual.md`](02-analyst-manual.md) — AI 애널리스트 사용 설명서(설치·화면·학습
   과정·DB·git·문제 해결)
-- [`AGENTS.md`](AGENTS.md) — 사내 코딩 에이전트(OpenCode)용 운영 지침
+- [`03-dataplat-manual.md`](03-dataplat-manual.md) — 데이터 플랫폼 연결 설명서(팀 기존
+  SQLite를 뷰 하나로 연결해 버전 관리·API·대시보드·챗봇에 붙이는 법, 검증 체크리스트)
+- [`AGENTS.md`](AGENTS.md) — 사내 코딩 에이전트(OpenCode)용 운영 지침(AI 애널리스트 +
+  데이터 플랫폼)
 
 ## 사내 LLM 성능 측정 스크립트 — `llm_bench.py`
 

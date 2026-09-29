@@ -212,6 +212,122 @@ python -m aioffice.analyst.mcp --vault <vault> --env .env
 `server/scripts/dashboard_client_example.py`(표준 라이브러리만 사용). 자세한 내용(엔드포인트
 표, 예시 응답, `opencode.json` 등록)은 공개 가이드 `02-analyst-manual.md` 10절 참고.
 
+## 데이터 플랫폼 (팀 기존 SQLite 연결 → 버전 관리 → API/대시보드/챗봇)
+
+**엑셀을 직접 읽지 않습니다.** 팀의 엑셀 집계는 이미 사내 파이프라인이 SQLite로 만들고 있으므로,
+`dataplat`은 그 SQLite를 읽기 전용으로 연결해 **표준 컬럼**(`dataset, metric, entity, region,
+period, source, value, unit`)으로 매핑하는 뷰/쿼리 하나만 있으면 됩니다. 스냅샷마다 내용이
+바뀌었는지 확인해 바뀐 것만 버전으로 쌓고, HTTP API(대시보드용)와 한국어 챗봇을 제공합니다.
+추가 설치가 필요 없습니다(표준 라이브러리 `sqlite3` + 이미 있는 `pyyaml`만 사용).
+
+### 1. 연결 설정 (`source.yaml`)
+
+팀 DB에 표준 컬럼을 내는 뷰(또는 쿼리)를 하나 만들고, `source.yaml`로 가리킵니다:
+
+```yaml
+db: C:/data/team.sqlite          # source.yaml 기준 상대경로도 허용
+view: v_dataplat_observations    # 또는 query: "SELECT ... FROM ..."
+rename:                          # 뷰가 표준 이름과 다른 컬럼명을 쓸 때만
+  broker: source
+```
+
+기존 테이블을 표준 컬럼으로 매핑/UNION하는 예시(리네임, 여러 테이블 UNION, wide→long 변환
+포함)는 `aioffice/dataplat/samples/example_view.sql`과 `aioffice/dataplat/samples/source.yaml`을,
+직접 손으로 쓰는 전체 안내는 공개 가이드 `03-dataplat-manual.md`를 보세요.
+
+### 2. 스냅샷 (`snapshot`) — 버전 관리의 핵심
+
+```powershell
+python -m aioffice.dataplat.snapshot --source source.yaml --db dataplat.sqlite [--dataset NAME] [--dry-run]
+```
+
+소스 쿼리를 읽어(읽기 전용 연결) `dataset` 컬럼으로 묶고, 데이터셋별로 이전 스냅샷과 내용이
+같으면(정렬된 행의 해시 비교) `skipped_duplicate`, 다르면 새 버전(load)을 `dataplat.sqlite`에
+씁니다. 콘솔에 한국어 요약(적재 행 수, 추가/삭제/변경 건수)을 출력하고, 오류가 있는 데이터셋이
+있어도 나머지는 계속 처리하며 종료 코드 1을 반환합니다. `--dry-run`은 DB에 쓰지 않고 리포트만
+보여줍니다.
+
+### 3. 예약 실행 (`schedule`)
+
+```powershell
+python -m aioffice.dataplat.schedule install --day MON --time 08:00 --pre "<기존 집계 명령>" --source source.yaml --db dataplat.sqlite
+python -m aioffice.dataplat.schedule show
+python -m aioffice.dataplat.schedule remove
+```
+
+`dataplat.sqlite` 옆에 `.cmd` 래퍼를 만들어(로그는 `dataplat_run.log`) `--pre` 명령이 성공했을
+때만 스냅샷을 실행하도록 Windows 작업 스케줄러(`schtasks`)에 매주 작업으로 등록합니다. 로그온한
+사용자 세션에서만 실행됩니다(`/RU` 없음 — 팀의 집계 단계가 엑셀/매핑 드라이브를 쓸 수 있어
+무인 실행으로 등록하지 않습니다).
+
+### 4. 서버 (API + 대시보드 + 챗봇)
+
+```powershell
+python -m aioffice.dataplat.server --db dataplat.sqlite --source source.yaml --site <대시보드 site/ 빌드 폴더> --pre "<기존 집계 명령>" --env .env --port 8000 --admin-token <토큰>
+```
+
+대시보드 정적 빌드(`--site`, SPA 폴백)와 API를 같은 origin에서 서빙하므로 운영 환경에서는
+CORS 설정이 필요 없습니다(`--cors`는 Vite 개발 서버 전용). `127.0.0.1`이 아닌 `--host`로 열려면
+`--admin-token`이 필수(없으면 시작 거부)입니다.
+
+| 엔드포인트 | 설명 |
+|---|---|
+| `GET /api/catalog` | 데이터셋별 title·metrics·entities·regions·sources·units·기간·마지막 적재 |
+| `GET /api/query?dataset=&metric=&entity=&region=&source=&period_from=&period_to=&version=latest\|all\|<id>&format=long\|wide&rows=&cols=` | 조회(다중값은 콤마 구분). `format=wide`일 때 `rows`/`cols`로 행·열 축 지정. 5,000행/20,000셀 초과 시 400 |
+| `GET /api/history?dataset=&metric=&entity=&period=&source=` | 특정 값의 버전(스냅샷)별 변화 — 수정 이력 차트용 |
+| `GET /api/loads[?dataset=]`, `GET /api/loads/<id>` | 적재 이력 목록/상세(diff 포함 리포트) |
+| `POST /api/refresh {dataset?}` | `--pre` 명령(설정 시) 성공 후 스냅샷 실행(백그라운드 스레드, 동시 1건, 실행 중이면 409). `GET /api/refresh/status`로 진행 확인. **`--admin-token` 필요** |
+| `POST /api/chat {message, history?}` | 챗봇(아래 참고). 동시 1건(처리 중이면 409 + 한국어 메시지) |
+
+읽기 엔드포인트는 인증 없이 열려 있습니다(사내망 대시보드 전제). `POST /api/refresh`만
+`Authorization: Bearer <token>` 또는 `X-API-Key` 헤더를 확인합니다.
+
+### 5. 대시보드 연동
+
+`aioffice/dataplat/clients/dataplat-client.ts`(fetch만 쓰는 프레임워크 무관 타입 클라이언트,
+차트 라이브러리는 지정하지 않음)를 Vite+React+shadcn 대시보드에 복사해 쓰세요.
+
+```tsx
+import { useEffect, useState } from "react";
+import { DataplatClient, WideResult } from "./dataplat-client";
+
+const client = new DataplatClient(""); // 같은 origin이면 빈 문자열 (server.py가 site를 같이 서빙)
+
+function ShipmentsTable() {
+  const [data, setData] = useState<WideResult | null>(null);
+  useEffect(() => {
+    client.queryWide({ dataset: "shipments", format: "wide", rows: ["entity"], cols: ["period"] })
+      .then(setData)
+      .catch(console.error);
+  }, []);
+  if (!data) return <p>불러오는 중...</p>;
+  return (/* data.columns / data.rows로 표 렌더링 */ null);
+}
+```
+
+기존 정적 서버(`dataplat.server`가 대체)에서 직접 엑셀/파일을 읽던 로딩 로직이 있었다면 위
+클라이언트의 `catalog()`/`queryWide()`/`history()` 호출로 바꾸면 됩니다.
+
+### 6. 챗봇 (`dataplat/chat.py`)
+
+LLM은 숫자나 SQL을 직접 쓰지 않고 **조회 명세(JSON)만** 채웁니다: (1) LLM 호출 없이 트라이그램
+유사도로 카탈로그를 좁히고(지표·대상 최대 40개), (2) `LLMClient.complete_json`으로 조회 명세를
+받고, (3) 이름을 카탈로그와 대조해 유사도 0.85 이상이면 자동 교정, 아니면 후보 5개를 담은
+되물음(clarify)을 반환하고, (4) 코드가 직접 쿼리를 실행하고, (5)
+`LLMClient.complete_json`으로 설명 문장 하나를 받되 **문장 속 모든 숫자가 결과 표에 있는지**
+(`aioffice.analyst.steps.normalize_number` 재사용) 확인해서, 하나라도 없으면 코드가 만든
+템플릿 문장(첫 값→마지막 값, 최댓값/최솟값)으로 바꿔치기합니다. 참고용 단일 페이지 챗
+UI(오프라인, 외부 라이브러리 없음)가 `/chat`에서 서빙됩니다 — 팀 React 앱에 그대로 임베드하거나
+다시 구현하세요.
+
+### 보안
+
+- 소스 SQLite는 항상 읽기 전용으로 엽니다(`sqlite3.connect(..., uri=True)` + `mode=ro`) —
+  `dataplat`은 팀의 원본 DB에 쓰지 않습니다.
+- `--admin-token`은 로그·콘솔에 출력되지 않습니다. `.env`의 `LLM_API_KEY`와 마찬가지로 값
+  자체를 채팅·커밋에 남기지 마세요.
+- `dataplat.sqlite`, `source.yaml`(팀 DB 경로가 들어 있음)은 git에 커밋하지 않는 걸 권장합니다.
+
 ## 테스트
 
 ```powershell

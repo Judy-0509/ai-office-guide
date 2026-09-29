@@ -1,0 +1,81 @@
+"""Builds a small, fully fictional SQLite database standing in for a team's existing
+Excel-ingest/aggregation database, for tests and the live-check (`dataplat` never talks to a
+real internal DB in this repo). Two raw tables in two different shapes (one already "long", one
+"wide" with quarters as columns) plus a view that maps/unions both into the standard columns --
+see `samples/example_view.sql` for the same view as a standalone, commented example, and
+`samples/source.yaml` for the matching config.
+
+`build(path, state="v1")` writes state v1; `state="v2"` changes one `shipments` value and drops
+one `shipments` row, leaving `price_index` unchanged -- enough to exercise both "value changed"
+and "row removed" in a diff, and a same-content skip on the untouched dataset.
+"""
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+_SHIPMENTS_V1 = [
+    # metric, entity, period, dept(region), inst(source), qty
+    ("출하량", "모델A", "2024Q1", "한국", "기관A", "1,200"),
+    ("출하량", "모델A", "2024Q2", "한국", "기관A", "1,350"),
+    ("출하량", "모델B", "2024Q1", "한국", "기관A", "800"),
+    ("출하량", "모델B", "2024Q2", "한국", "기관A", "910"),
+    ("출하량", "모델C", "2024Q1", "북미", "기관B", "n.a."),  # dropped: non-numeric marker
+    ("출하량", "모델C", "2024Q2", "북미", "기관B", "430"),
+]
+
+_SHIPMENTS_V2 = [
+    ("출하량", "모델A", "2024Q1", "한국", "기관A", "1,500"),  # changed 1200 -> 1500
+    ("출하량", "모델A", "2024Q2", "한국", "기관A", "1,350"),
+    ("출하량", "모델B", "2024Q1", "한국", "기관A", "800"),
+    ("출하량", "모델B", "2024Q2", "한국", "기관A", "910"),
+    ("출하량", "모델C", "2024Q1", "북미", "기관B", "n.a."),
+    # 모델C 2024Q2 row removed entirely
+]
+
+_PRICE_INDEX = [
+    # entity, region, q1, q2, q3, q4
+    ("제품A", "KR", 100.0, 101.5, 99.0, 103.2),
+    ("제품B", "US", 98.0, 97.4, 96.8, 95.1),
+]
+
+_VIEW_SQL = """
+CREATE VIEW v_dataplat_observations AS
+SELECT 'shipments' AS dataset, metric, entity, dept AS region, period, inst AS broker,
+       qty AS value, '' AS unit
+FROM tbl_shipments_long
+UNION ALL
+SELECT 'price_index' AS dataset, '가격지수' AS metric, entity, region, '2024Q1' AS period,
+       '' AS broker, q1 AS value, 'pt' AS unit FROM tbl_price_index_wide
+UNION ALL
+SELECT 'price_index' AS dataset, '가격지수' AS metric, entity, region, '2024Q2' AS period,
+       '' AS broker, q2 AS value, 'pt' AS unit FROM tbl_price_index_wide
+UNION ALL
+SELECT 'price_index' AS dataset, '가격지수' AS metric, entity, region, '2024Q3' AS period,
+       '' AS broker, q3 AS value, 'pt' AS unit FROM tbl_price_index_wide
+UNION ALL
+SELECT 'price_index' AS dataset, '가격지수' AS metric, entity, region, '2024Q4' AS period,
+       '' AS broker, q4 AS value, 'pt' AS unit FROM tbl_price_index_wide
+"""
+
+
+def build(path: Path, state: str = "v1") -> Path:
+    path = Path(path)
+    if path.exists():
+        path.unlink()
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.executescript(
+            "CREATE TABLE tbl_shipments_long "
+            "(metric TEXT, entity TEXT, period TEXT, dept TEXT, inst TEXT, qty TEXT);"
+            "CREATE TABLE tbl_price_index_wide "
+            "(entity TEXT, region TEXT, q1 REAL, q2 REAL, q3 REAL, q4 REAL);"
+        )
+        shipments = _SHIPMENTS_V1 if state == "v1" else _SHIPMENTS_V2
+        conn.executemany("INSERT INTO tbl_shipments_long VALUES (?,?,?,?,?,?)", shipments)
+        conn.executemany("INSERT INTO tbl_price_index_wide VALUES (?,?,?,?,?,?)", _PRICE_INDEX)
+        conn.executescript(_VIEW_SQL)
+        conn.commit()
+    finally:
+        conn.close()
+    return path

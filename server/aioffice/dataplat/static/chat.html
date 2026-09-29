@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>데이터 플랫폼 챗봇</title>
+<style>
+  :root { color-scheme: light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, "Segoe UI", "Malgun Gothic", sans-serif;
+    background: #f5f6f8; color: #1a1a1a; display: flex; flex-direction: column; height: 100vh;
+  }
+  header { padding: 12px 16px; background: #1f2937; color: #fff; font-size: 15px; flex: none; }
+  #log { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 720px; padding: 10px 14px; border-radius: 10px; line-height: 1.5; white-space: pre-wrap; }
+  .msg.user { align-self: flex-end; background: #2563eb; color: #fff; }
+  .msg.bot { align-self: flex-start; background: #fff; border: 1px solid #e5e7eb; }
+  .msg.error { align-self: flex-start; background: #fee2e2; border: 1px solid #fca5a5; }
+  .seconds { font-size: 11px; color: #9ca3af; margin-top: 4px; }
+  .warnings { font-size: 11px; color: #b45309; margin-top: 4px; }
+  table.result { border-collapse: collapse; margin-top: 8px; font-size: 13px; }
+  table.result th, table.result td { border: 1px solid #e5e7eb; padding: 4px 8px; text-align: right; }
+  table.result th:first-child, table.result td:first-child { text-align: left; }
+  svg.chart { margin-top: 8px; background: #fff; border: 1px solid #e5e7eb; border-radius: 6px; }
+  .suggestions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .suggestions button {
+    border: 1px solid #93c5fd; background: #eff6ff; color: #1d4ed8; border-radius: 999px;
+    padding: 4px 12px; font-size: 12px; cursor: pointer;
+  }
+  .suggestions button:hover { background: #dbeafe; }
+  #inputRow { flex: none; display: flex; gap: 8px; padding: 12px 16px; background: #fff; border-top: 1px solid #e5e7eb; }
+  #inputRow input { flex: 1; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px; }
+  #inputRow button { padding: 10px 18px; border: none; border-radius: 8px; background: #2563eb; color: #fff; cursor: pointer; }
+  #inputRow button:disabled { background: #9ca3af; cursor: default; }
+</style>
+</head>
+<body>
+<header>데이터 플랫폼 챗봇 -- 표와 차트로 답합니다 (참고용 단일 페이지, 팀 React 앱에 이식하거나 임베드하세요)</header>
+<div id="log"></div>
+<div id="inputRow">
+  <input id="input" type="text" placeholder="예: 모델A 출하량 분기별로 보여줘" autocomplete="off">
+  <button id="send">보내기</button>
+</div>
+<script>
+(function () {
+  "use strict";
+  var log = document.getElementById("log");
+  var input = document.getElementById("input");
+  var sendBtn = document.getElementById("send");
+  var history = [];
+  var busy = false;
+
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text != null) e.textContent = text;
+    return e;
+  }
+
+  function addMessage(cls, text) {
+    var m = el("div", "msg " + cls, text);
+    log.appendChild(m);
+    log.scrollTop = log.scrollHeight;
+    return m;
+  }
+
+  function renderTable(container, table) {
+    if (!table || !table.rows || !table.rows.length) return;
+    var t = el("table", "result");
+    var thead = document.createElement("thead");
+    var headRow = document.createElement("tr");
+    (table.columns || []).forEach(function (c) { headRow.appendChild(el("th", null, String(c))); });
+    thead.appendChild(headRow);
+    t.appendChild(thead);
+    var tbody = document.createElement("tbody");
+    table.rows.forEach(function (row) {
+      var tr = document.createElement("tr");
+      row.forEach(function (v) { tr.appendChild(el("td", null, v == null ? "" : String(v))); });
+      tbody.appendChild(tr);
+    });
+    t.appendChild(tbody);
+    container.appendChild(t);
+  }
+
+  function renderChart(container, chart) {
+    if (!chart || !chart.series || !chart.series.length || !chart.x || !chart.x.length) return;
+    var W = 640, H = 220, padL = 40, padR = 16, padT = 12, padB = 28;
+    var innerW = W - padL - padR, innerH = H - padT - padB;
+    var allValues = [];
+    chart.series.forEach(function (s) { (s.values || []).forEach(function (v) { if (typeof v === "number") allValues.push(v); }); });
+    var vmin = Math.min(0, allValues.length ? Math.min.apply(null, allValues) : 0);
+    var vmax = allValues.length ? Math.max.apply(null, allValues) : 1;
+    if (vmax === vmin) vmax = vmin + 1;
+    var n = chart.x.length;
+    var xStep = n > 1 ? innerW / (n - 1) : 0;
+    function xAt(i) { return padL + (n > 1 ? i * xStep : innerW / 2); }
+    function yAt(v) { return padT + innerH - ((v - vmin) / (vmax - vmin)) * innerH; }
+
+    var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("class", "chart");
+    svg.setAttribute("width", W); svg.setAttribute("height", H);
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+
+    var axis = document.createElementNS(svg.namespaceURI, "line");
+    axis.setAttribute("x1", padL); axis.setAttribute("y1", yAt(vmin));
+    axis.setAttribute("x2", W - padR); axis.setAttribute("y2", yAt(vmin));
+    axis.setAttribute("stroke", "#d1d5db");
+    svg.appendChild(axis);
+
+    var colors = ["#2563eb", "#dc2626", "#059669", "#d97706", "#7c3aed", "#0891b2"];
+    var barType = chart.type === "bar" || chart.type === "stacked";
+    var barWidth = Math.max(4, (xStep || innerW / Math.max(1, n)) / (chart.series.length + 1) - 2);
+
+    chart.series.forEach(function (s, si) {
+      var color = colors[si % colors.length];
+      if (barType) {
+        (s.values || []).forEach(function (v, i) {
+          if (typeof v !== "number") return;
+          var x = xAt(i) - (barWidth * chart.series.length) / 2 + si * barWidth;
+          var y = yAt(Math.max(v, 0));
+          var h = Math.abs(yAt(v) - yAt(0));
+          var rect = document.createElementNS(svg.namespaceURI, "rect");
+          rect.setAttribute("x", x); rect.setAttribute("y", v >= 0 ? y : yAt(0));
+          rect.setAttribute("width", barWidth); rect.setAttribute("height", h || 1);
+          rect.setAttribute("fill", color);
+          svg.appendChild(rect);
+        });
+      } else {
+        var points = (s.values || []).map(function (v, i) {
+          return typeof v === "number" ? xAt(i) + "," + yAt(v) : null;
+        }).filter(Boolean).join(" ");
+        var poly = document.createElementNS(svg.namespaceURI, "polyline");
+        poly.setAttribute("points", points);
+        poly.setAttribute("fill", "none");
+        poly.setAttribute("stroke", color);
+        poly.setAttribute("stroke-width", "2");
+        svg.appendChild(poly);
+      }
+    });
+
+    chart.x.forEach(function (label, i) {
+      var text = document.createElementNS(svg.namespaceURI, "text");
+      text.setAttribute("x", xAt(i)); text.setAttribute("y", H - 8);
+      text.setAttribute("font-size", "10"); text.setAttribute("text-anchor", "middle");
+      text.setAttribute("fill", "#6b7280");
+      text.textContent = String(label);
+      svg.appendChild(text);
+    });
+
+    container.appendChild(svg);
+  }
+
+  // "다시 묻기": clarification answers list candidates after "다음 중 하나인가요?"/"후보:" --
+  // turn those into one-click quick replies instead of asking the user to retype.
+  function parseSuggestions(text) {
+    var m = /(?:다음 중 하나인가요\?|후보:)\s*(.+)$/.exec(text);
+    if (!m) return [];
+    return m[1].split(",").map(function (s) { return s.trim(); })
+      .filter(function (s) { return s && s !== "(없음)" && s !== "(후보 없음)"; });
+  }
+
+  function renderSuggestions(container, text) {
+    var options = parseSuggestions(text);
+    if (!options.length) return;
+    var box = el("div", "suggestions");
+    options.forEach(function (opt) {
+      var b = el("button", null, opt);
+      b.addEventListener("click", function () { send(opt); });
+      box.appendChild(b);
+    });
+    container.appendChild(box);
+  }
+
+  function setBusy(v) {
+    busy = v;
+    sendBtn.disabled = v;
+    input.disabled = v;
+  }
+
+  function send(text) {
+    text = (text || input.value).trim();
+    if (!text || busy) return;
+    addMessage("user", text);
+    history.push({ role: "user", content: text });
+    input.value = "";
+    setBusy(true);
+
+    fetch("/api/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message: text, history: history.slice(-8) }),
+    })
+      .then(function (res) { return res.json().then(function (body) { return { ok: res.ok, body: body }; }); })
+      .then(function (r) {
+        if (!r.ok) {
+          addMessage("error", r.body.error || "오류가 발생했습니다");
+          return;
+        }
+        var data = r.body;
+        var bot = addMessage("bot", data.answer || "");
+        renderTable(bot, data.table);
+        renderChart(bot, data.chart);
+        if (data.warnings && data.warnings.indexOf("clarify") !== -1) {
+          renderSuggestions(bot, data.answer || "");
+        }
+        var meta = el("div", "seconds", (data.seconds != null ? data.seconds + "초" : ""));
+        bot.appendChild(meta);
+        history.push({ role: "assistant", content: data.answer || "" });
+      })
+      .catch(function (err) { addMessage("error", "요청 실패: " + err); })
+      .then(function () { setBusy(false); input.focus(); });
+  }
+
+  sendBtn.addEventListener("click", function () { send(); });
+  input.addEventListener("keydown", function (e) { if (e.key === "Enter") send(); });
+  addMessage("bot", "안녕하세요. 데이터에 대해 물어보세요 (예: \"모델A 출하량 분기별로 보여줘\", \"2024Q1 대비 바뀐 값 있어?\").");
+})();
+</script>
+</body>
+</html>
