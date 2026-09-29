@@ -311,7 +311,7 @@ class LLMClient:
         max_tokens: int | None = None,
         cancel: Any = None,
     ) -> Iterator[tuple[str, Any]]:
-        """Stream a chat completion, forwarding every `slides.stream.stream_chat` event, and
+        """Stream a chat completion, forwarding every `llm.stream.stream_chat` event, and
         log one llm_calls row at the end. If the backend sent no usage, estimates completion
         tokens from the accumulated content text. Never logs the API key.
 
@@ -319,7 +319,7 @@ class LLMClient:
         "generator ignored GeneratorExit" back through it) -- `finally` only logs; the final
         usage event is yielded after the try/finally, so it is skipped if an exception
         propagates instead of falling through."""
-        from ..slides.stream import stream_chat  # lazy: keeps llm/ independent of slides/
+        from .stream import stream_chat  # lazy: keeps this method's httpx use out of the hot path
 
         use_model = model if model is not None else self.backend.model_for()
         started = time.perf_counter()

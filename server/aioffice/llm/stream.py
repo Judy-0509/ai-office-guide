@@ -1,24 +1,20 @@
-"""Streaming chat call + incremental JSON-Lines op parser.
-
-Research basis (see the work order): JSON Lines is the most robust streaming format for a
-27B model -- one bad token spoils one slide line, not the whole deck. `OpParser` parses ONLY
-the content channel, never reasoning.
+"""Streaming chat call over the direct backend's HTTP path (SSE), with `<think>...</think>` tag
+routing for servers that put reasoning inside the content channel instead of a separate field.
+Used by `LLMClient.stream_complete` (slides studio); `aioffice.slides.stream.OpParser` (the
+incremental JSON-Lines op parser fed by these events) stays in `slides/` since it's
+slides-specific, and re-imports `stream_chat` from here.
 """
-
 from __future__ import annotations
 
 import json
-import re
 import time
 from typing import Any, Iterator
 
 import httpx
 
 from ..config import Settings
-from ..llm import BackendError
-from ..llm.direct import BACKOFF_SECONDS, RETRYABLE_STATUS
-from ..llm.schemas import SchemaError
-from . import spec
+from . import BackendError
+from .direct import BACKOFF_SECONDS, RETRYABLE_STATUS
 
 Event = tuple[str, Any]
 
@@ -171,45 +167,3 @@ def _consume(response: httpx.Response, cancel: Any) -> Iterator[Event]:
     yield from router.close()
     if finish_reason == "length":
         yield ("error", "출력이 max_tokens에서 잘렸습니다")
-
-
-class OpParser:
-    """Incremental JSON-Lines op parser. `feed(text)` buffers partial lines across chunks,
-    skips blank lines and ``` fences, tolerates a stray prose line (reported as a warning),
-    and validates each op + slide against spec.py. Invalid lines never raise -- they land in
-    `self.warnings`."""
-
-    _FENCE_RE = re.compile(r"^```\w*$")
-
-    def __init__(self) -> None:
-        self._buf = ""
-        self.warnings: list[str] = []
-
-    def feed(self, text: str) -> list[dict]:
-        self._buf += text
-        lines = self._buf.split("\n")
-        self._buf = lines.pop()  # last element may be a partial line
-        return self._parse_lines(lines)
-
-    def close(self) -> list[dict]:
-        remaining, self._buf = self._buf, ""
-        if not remaining.strip():
-            return []
-        return self._parse_lines([remaining])
-
-    def _parse_lines(self, lines: list[str]) -> list[dict]:
-        ops: list[dict] = []
-        for raw in lines:
-            line = raw.strip()
-            if not line or self._FENCE_RE.match(line):
-                continue
-            try:
-                data = json.loads(line)
-            except ValueError:
-                self.warnings.append(f"모델 출력 중 무시된 줄: {line[:80]}")
-                continue
-            try:
-                ops.append(spec.coerce_and_validate_op(data))
-            except SchemaError as exc:
-                self.warnings.append(str(exc))
-        return ops

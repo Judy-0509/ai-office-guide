@@ -532,7 +532,7 @@ def test_stream_complete_forwards_events_and_logs_the_call(settings, conn, fake_
         yield ("content", "안녕")
         yield ("usage", {"prompt_tokens": 11, "completion_tokens": 4})
 
-    monkeypatch.setattr("aioffice.slides.stream.stream_chat", fake_stream_chat)
+    monkeypatch.setattr("aioffice.llm.stream.stream_chat", fake_stream_chat)
     client = make_client(settings, conn, fake_backend(result={"ok": True}))
 
     events = list(client.stream_complete(MSG, step="slides.generate", agent="", max_tokens=999))
@@ -553,7 +553,7 @@ def test_stream_complete_surfaces_api_reasoning_tokens_when_present(settings, co
         yield ("usage", {"prompt_tokens": 11, "completion_tokens": 40,
                           "completion_tokens_details": {"reasoning_tokens": 33}})
 
-    monkeypatch.setattr("aioffice.slides.stream.stream_chat", fake_stream_chat)
+    monkeypatch.setattr("aioffice.llm.stream.stream_chat", fake_stream_chat)
     client = make_client(settings, conn, fake_backend(result={"ok": True}))
 
     events = list(client.stream_complete(MSG, step="s", agent="a"))
@@ -570,7 +570,7 @@ def test_stream_complete_does_not_yield_from_finally_on_early_close(settings, co
         yield ("content", "two")
         yield ("usage", {"prompt_tokens": 1, "completion_tokens": 1})
 
-    monkeypatch.setattr("aioffice.slides.stream.stream_chat", fake_stream_chat)
+    monkeypatch.setattr("aioffice.llm.stream.stream_chat", fake_stream_chat)
     client = make_client(settings, conn, fake_backend(result={"ok": True}))
 
     gen = client.stream_complete(MSG, step="s", agent="a")
@@ -582,7 +582,7 @@ def test_stream_complete_estimates_completion_tokens_when_no_usage_arrives(setti
     def fake_stream_chat(settings_arg, messages, max_tokens, *, client=None, cancel=None):
         yield ("content", "a" * 400)
 
-    monkeypatch.setattr("aioffice.slides.stream.stream_chat", fake_stream_chat)
+    monkeypatch.setattr("aioffice.llm.stream.stream_chat", fake_stream_chat)
     client = make_client(settings, conn, fake_backend(result={"ok": True}))
 
     events = list(client.stream_complete(MSG, step="s", agent="a"))
@@ -598,7 +598,7 @@ def test_stream_complete_marks_status_cancelled_when_cancel_event_is_set(setting
     def fake_stream_chat(settings_arg, messages, max_tokens, *, client=None, cancel=None):
         yield ("content", "일부만")
 
-    monkeypatch.setattr("aioffice.slides.stream.stream_chat", fake_stream_chat)
+    monkeypatch.setattr("aioffice.llm.stream.stream_chat", fake_stream_chat)
     client = make_client(settings, conn, fake_backend(result={"ok": True}))
     cancel = threading.Event()
     cancel.set()

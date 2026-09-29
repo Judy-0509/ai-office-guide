@@ -1,3 +1,6 @@
+"""Tests for aioffice.llm.stream.stream_chat (SSE streaming + <think> tag routing). Moved out
+of test_slides_stream.py so this doesn't depend on the slides package -- stream_chat is
+slides-agnostic (also used directly by LLMClient.stream_complete)."""
 from __future__ import annotations
 
 import json
@@ -6,80 +9,11 @@ import httpx
 import pytest
 
 from aioffice.llm import BackendError
-from aioffice.slides.stream import OpParser, stream_chat
+from aioffice.llm.stream import stream_chat
 
 MSG = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
 
 
-def _table_op(index=0, title="T"):
-    slide = {"layout": "table", "kicker": "01", "title": title,
-              "table": {"type": "table", "title": "표", "columns": ["a"], "rows": [["1"]]}}
-    return json.dumps({"op": "insert", "index": index, "slide": slide}, ensure_ascii=False)
-
-
-# --- OpParser ----------------------------------------------------------------------------
-def test_op_parser_parses_complete_lines_in_one_feed():
-    parser = OpParser()
-    ops = parser.feed(_table_op(0, "A") + "\n" + _table_op(1, "B") + "\n")
-    assert len(ops) == 2
-    assert parser.warnings == []
-
-
-def test_op_parser_buffers_a_line_split_across_chunks():
-    parser = OpParser()
-    line = _table_op(0, "A")
-    mid = len(line) // 2
-    assert parser.feed(line[:mid]) == []
-    ops = parser.feed(line[mid:] + "\n")
-    assert len(ops) == 1
-    assert ops[0]["slide"]["title"] == "A"
-
-
-def test_op_parser_skips_blank_lines_and_fences():
-    parser = OpParser()
-    text = "```jsonl\n\n" + _table_op(0, "A") + "\n```\n"
-    ops = parser.feed(text)
-    assert len(ops) == 1
-    assert parser.warnings == []
-
-
-def test_op_parser_reports_a_stray_prose_line_as_a_warning_but_keeps_going():
-    parser = OpParser()
-    text = "네, 슬라이드를 생성하겠습니다.\n" + _table_op(0, "A") + "\n"
-    ops = parser.feed(text)
-    assert len(ops) == 1
-    assert len(parser.warnings) == 1
-    assert "무시된 줄" in parser.warnings[0]
-
-
-def test_op_parser_reports_invalid_json_as_a_warning():
-    parser = OpParser()
-    ops = parser.feed('{"op": "insert", "index": 0, "slide": {bad json\n')
-    assert ops == []
-    assert len(parser.warnings) == 1
-
-
-def test_op_parser_reports_a_schema_validation_failure_as_a_warning():
-    parser = OpParser()
-    ops = parser.feed(json.dumps({"op": "insert", "index": 0, "slide": {"layout": "nope"}}) + "\n")
-    assert ops == []
-    assert len(parser.warnings) == 1
-
-
-def test_op_parser_close_flushes_the_last_unterminated_line():
-    parser = OpParser()
-    parser.feed(_table_op(0, "A"))  # no trailing newline yet
-    ops = parser.close()
-    assert len(ops) == 1
-
-
-def test_op_parser_close_on_empty_buffer_is_a_no_op():
-    parser = OpParser()
-    parser.feed(_table_op(0, "A") + "\n")
-    assert parser.close() == []
-
-
-# --- stream_chat ---------------------------------------------------------------------------
 def _sse(chunks: list[dict]) -> httpx.Response:
     body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
     return httpx.Response(200, content=body.encode("utf-8"),
@@ -157,7 +91,7 @@ def test_stream_chat_retries_5xx_before_the_first_byte(settings, monkeypatch):
             return httpx.Response(503)
         return _sse([{"choices": [{"delta": {"content": "ok"}}]}])
 
-    monkeypatch.setattr("aioffice.slides.stream.time.sleep", lambda s: None)
+    monkeypatch.setattr("aioffice.llm.stream.time.sleep", lambda s: None)
     client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://llm.test/v1")
     events = list(stream_chat(settings, MSG, 100, client=client))
     assert len(calls) == 3

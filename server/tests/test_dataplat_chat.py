@@ -94,6 +94,59 @@ def test_unknown_entity_triggers_clarification_with_candidates(ctx):
     assert "모델" in result["answer"]  # candidate list mentions a real entity
 
 
+def test_hallucinated_optional_source_is_dropped_with_warning_not_clarified(ctx):
+    # Regression for the live-check Q1 bug: the LLM added a source filter that doesn't exist
+    # for this dataset/message ("기관Z" is never mentioned) -- must be dropped, not block the
+    # whole query with a clarification.
+    ctx_obj, backend = ctx([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "sources": ["기관Z"],
+         "rows": ["entity"], "cols": ["period"], "clarify": None},
+        {"sentence": "요약입니다."},
+    ])
+    result = chat.answer(ctx_obj, "모델A 출하량 보여줘")
+    assert result["warnings"] == ["존재하지 않는 조건 '기관Z'는 제외했습니다"]
+    assert result["table"] is not None and result["table"]["rows"]
+    assert len(backend.calls) == 2  # spec + explain both ran -- query was not blocked
+
+
+def test_hallucinated_optional_region_is_dropped_with_warning(ctx):
+    ctx_obj, _backend = ctx([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A"], "regions": ["없는지역"],
+         "clarify": None},
+        {"sentence": "요약입니다."},
+    ])
+    result = chat.answer(ctx_obj, "모델A 출하량 보여줘")
+    assert "존재하지 않는 조건 '없는지역'는 제외했습니다" in result["warnings"]
+    assert result["table"] is not None
+
+
+def test_entity_the_model_added_on_its_own_is_dropped_not_clarified(ctx):
+    # The user asked for "everything", not a specific model -- the LLM enumerating a
+    # non-existent entity here must be dropped (optional), not turn into a clarification.
+    ctx_obj, backend = ctx([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A", "없는모델"],
+         "rows": ["entity"], "cols": ["period"], "clarify": None},
+        {"sentence": "요약입니다."},
+    ])
+    result = chat.answer(ctx_obj, "출하량 전체 다 보여줘")
+    assert result["warnings"] == ["존재하지 않는 조건 '없는모델'는 제외했습니다"]
+    assert result["table"] is not None
+    assert len(backend.calls) == 2
+
+
+def test_entity_the_user_explicitly_named_still_clarifies_even_mixed_with_optional_one(ctx):
+    # "없는모델" is explicitly in the user's message -> required -> clarify wins overall, even
+    # though a valid entity was also present.
+    ctx_obj, backend = ctx([
+        {"dataset": "shipments", "metrics": ["출하량"], "entities": ["모델A", "없는모델"],
+         "clarify": None},
+    ])
+    result = chat.answer(ctx_obj, "모델A랑 없는모델 출하량 비교해줘")
+    assert result["warnings"] == ["clarify"]
+    assert result["table"] is None
+    assert len(backend.calls) == 1  # explain never ran -- blocked before the query
+
+
 def test_llm_clarify_field_short_circuits_before_query(ctx):
     ctx_obj, backend = ctx([
         {"dataset": "shipments", "clarify": "어떤 지표를 원하시나요?"},

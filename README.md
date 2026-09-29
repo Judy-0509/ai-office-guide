@@ -1,18 +1,17 @@
-# AI Office 사내 작업 안내서
+# AI Office 데이터 플랫폼
 
 사외 개발 환경에 접근할 수 없는 사내 PC에서 참고하기 위한 문서와 코드 모음입니다. 리포트
 원문·파일명·팀 업무 세부 내용은 이 저장소에 올리지 않습니다.
 
 ## 이 저장소는 무엇인가
 
-- **AI 애널리스트** (`server/aioffice/analyst`) — 증권사 리포트를 날짜순으로 10건씩 학습해
-  주제·주장·관계를 Markdown 지식 폴더("vault")와 SQLite에 쌓고, 오프라인 뷰어로 보는 도구입니다.
-- **사내 LLM 벤치마크** — 동시 요청 처리량과 리포트 추출 품질을 재는 독립 실행 스크립트
-  (`llm_bench.py`, 아래 참고).
-- **슬라이드 스튜디오** (`server/aioffice/slides`) — 사내 LLM이 주간 리포트 슬라이드를 라이브로
-  그려주는 이전 작업물입니다. 사용법은 `server/README.md`의 "슬라이드 스튜디오" 절을 보세요.
+**대시보드 데이터 연결 도구**(`server/aioffice/dataplat`) — 팀이 이미 엑셀을 읽어 SQLite로
+집계해 둔 파이프라인을, 다시 만들지 않고 버전 관리(주차별 비교) + HTTP API + 대시보드 + 한국어
+챗봇에 연결합니다. **엑셀을 직접 읽지 않습니다** — 팀의 기존 SQLite를 읽기 전용으로만 열고,
+표준 컬럼(`dataset, metric, entity, region, period, source, value, unit`)을 내는 뷰/쿼리
+하나만 있으면 나머지(버전 관리·API·대시보드·챗봇)는 자동입니다.
 
-## 빠른 시작 — AI 애널리스트
+## 빠른 시작
 
 1. **받기**: 이 저장소를 사내 PC로 내려받습니다.
 2. **설치** (PowerShell):
@@ -21,29 +20,36 @@
    python -m venv .venv
    .\.venv\Scripts\Activate.ps1
    python -m pip install -e ".[dev]"
+   Copy-Item .env.example .env
    ```
-   PDF 리포트를 읽으려면 `pip install docling`(표·OCR 없이 변환) 또는 `pip install pymupdf`
-   (가볍고 빠름) 중 하나를 추가로 설치하세요. 둘 다 없으면 `.pdf`는 건너뜁니다.
-3. **`.env` 작성**: `Copy-Item .env.example .env` 후 사내 LLM 주소·키·모델을 채웁니다. 키
-   하나하나의 뜻은 [`02-analyst-manual.md`](02-analyst-manual.md)를 보세요.
-4. **리포트 폴더 준비**: 학습할 `.md`/`.txt`/`.pdf` 리포트를 폴더 하나에 모읍니다. 견본은
-   `server/aioffice/analyst/samples/reports/`에 있습니다.
-5. **실행**:
+   추가 설치(extras)가 필요 없습니다 — 표준 의존성만으로 동작합니다.
+3. **`.env` 작성**: 사내 LLM 주소·키·모델을 채웁니다(챗봇의 spec/설명 두 호출에 씁니다). 키
+   하나하나의 뜻은 [`server/README.md`](server/README.md)를 보세요.
+4. **팀 SQLite에 연결**: 표준 컬럼을 내는 뷰를 하나 쓰고 `source.yaml`로 가리킵니다 — 예시와
+   세 가지 매핑 패턴(컬럼명만 맞추기 / 여러 테이블 UNION / wide→long)은
+   [`03-dataplat-manual.md`](03-dataplat-manual.md) 2절을 보세요.
+5. **점검 후 실제 적재**:
    ```
-   python -m aioffice.analyst.run --inbox <리포트 폴더> --vault <vault 폴더> --env .env --batch 10
+   python -m aioffice.dataplat.snapshot --source source.yaml --db dataplat.sqlite --dry-run
+   python -m aioffice.dataplat.snapshot --source source.yaml --db dataplat.sqlite
    ```
-   앱 창이 뜨고 다음 10건 학습이 자동으로 시작됩니다.
+6. **서버 실행** (API + 대시보드 + 챗봇, 같은 origin):
+   ```
+   python -m aioffice.dataplat.server --db dataplat.sqlite --source source.yaml --site <대시보드 site/ 빌드 폴더> --env .env
+   ```
+
+설치부터 예약 실행·대시보드 연동·검증까지 전체 흐름은
+**[`03-dataplat-manual.md`](03-dataplat-manual.md)**에 정리되어 있습니다.
 
 ## 문서
 
-- [`01-topic-importance-approaches.md`](01-topic-importance-approaches.md) — 처음 보는 리포트
-  100~200건에서 이번 주 핵심 주제와 주제 간 연관을 찾는 3가지 방법 비교
-- [`02-analyst-manual.md`](02-analyst-manual.md) — AI 애널리스트 사용 설명서(설치·화면·학습
-  과정·DB·git·문제 해결)
-- [`03-dataplat-manual.md`](03-dataplat-manual.md) — 데이터 플랫폼 연결 설명서(팀 기존
-  SQLite를 뷰 하나로 연결해 버전 관리·API·대시보드·챗봇에 붙이는 법, 검증 체크리스트)
-- [`AGENTS.md`](AGENTS.md) — 사내 코딩 에이전트(OpenCode)용 운영 지침(AI 애널리스트 +
-  데이터 플랫폼)
+- [`03-dataplat-manual.md`](03-dataplat-manual.md) — 데이터 플랫폼 연결 설명서(뷰 작성법,
+  `source.yaml`, 스냅샷/예약/서버 명령, API 엔드포인트, 대시보드 연동(`dataplat-client.ts`),
+  챗봇 동작·한계, 검증 체크리스트)
+- [`server/README.md`](server/README.md) — 설치·`.env` 키·명령어 요약(짧은 안내)
+- [`AGENTS.md`](AGENTS.md) — 사내 코딩 에이전트(OpenCode)용 운영 지침
+- [`01-topic-importance-approaches.md`](01-topic-importance-approaches.md) — 참고 문서: 처음
+  보는 리포트 100~200건에서 이번 주 핵심 주제와 주제 간 연관을 찾는 3가지 방법 비교
 
 ## 사내 LLM 성능 측정 스크립트 — `llm_bench.py`
 

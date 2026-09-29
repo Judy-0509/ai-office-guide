@@ -1,8 +1,8 @@
 """dataplat chatbot. The LLM never writes numbers or SQL -- it only fills a query form from a
 narrowed catalog (`spec_messages`); our own code runs the query against `dataplat.sqlite`; the
 explanation sentence is checked number-by-number against the query result (reusing
-`aioffice.analyst.steps.normalize_number`, the same guard the analyst pipeline uses) before
-it's trusted, falling back to a code-generated template sentence otherwise.
+`aioffice.numbers.normalize_number`, the same guard the analyst pipeline's claim checker uses)
+before it's trusted, falling back to a code-generated template sentence otherwise.
 
 Pipeline: narrow_catalog (no LLM, trigram similarity) -> spec call (LLMClient.complete_json)
 -> validate/auto-correct/clarify -> run the query -> explain call -> answer().
@@ -17,8 +17,8 @@ from dataclasses import dataclass
 from sqlite3 import Connection
 from typing import Any
 
-from ..analyst.steps import normalize_number
 from ..llm.client import LLMClient, LLMError
+from ..numbers import normalize_number
 from . import store
 
 MAX_METRICS = 40
@@ -152,19 +152,52 @@ def _resolve_one(name: str, candidates: list[str]) -> tuple[str | None, float]:
     return scored[0]
 
 
-def resolve_names(values: list[str] | None, candidates: list[str]) -> tuple[list[str], list[str]]:
-    """(resolved names, Korean clarification questions for names that didn't auto-correct)."""
+def resolve_names(values: list[str] | None, candidates: list[str], *,
+                   required: bool = True) -> tuple[list[str], list[str], list[str]]:
+    """(resolved names, clarification questions, drop warnings).
+
+    `required=True` (dataset/metric, or an entity the user explicitly named): a name that
+    doesn't auto-correct produces a clarification question and stops the query.
+    `required=False` (optional filters -- source/region, and an entity the LLM added on its own
+    that the user never typed, e.g. expanding "제품별" into every catalog entity): a name that
+    doesn't auto-correct is DROPPED instead, with a Korean warning -- it never blocks the query.
+    """
     resolved: list[str] = []
     questions: list[str] = []
+    warnings: list[str] = []
     for name in values or []:
         match, score = _resolve_one(name, candidates)
         if match is not None and (match == name or score >= AUTOCORRECT_THRESHOLD):
             resolved.append(match)
-        else:
+        elif required:
             top = _top_candidates(name, candidates, MAX_CLARIFY_CANDIDATES) if candidates else []
             options = ", ".join(top) if top else "(후보 없음)"
             questions.append(f'"{name}"을(를) 찾을 수 없습니다. 다음 중 하나인가요? {options}')
-    return resolved, questions
+        else:
+            warnings.append(f"존재하지 않는 조건 '{name}'는 제외했습니다")
+    return resolved, questions, warnings
+
+
+def _mentioned_in_message(name: str, message: str) -> bool:
+    """Did the user's raw text actually contain this name, or did the LLM add it on its own
+    (e.g. expanding "제품별" into every catalog entity)? A plain, whitespace-insensitive
+    substring check -- good enough to tell "the user typed this" from "the model inferred
+    this", without a second LLM call."""
+    norm_name = "".join(str(name).split())
+    norm_message = "".join(message.split())
+    return bool(norm_name) and norm_name in norm_message
+
+
+def resolve_entities(values: list[str] | None, candidates: list[str],
+                      message: str) -> tuple[list[str], list[str], list[str]]:
+    """Like `resolve_names`, but per-entity required-ness: an entity the user explicitly named
+    in `message` is required (clarify on failure); one the model added on its own is optional
+    (dropped with a warning on failure)."""
+    explicit = [v for v in (values or []) if _mentioned_in_message(v, message)]
+    implicit = [v for v in (values or []) if not _mentioned_in_message(v, message)]
+    resolved_e, questions, _ = resolve_names(explicit, candidates, required=True)
+    resolved_i, _, warnings = resolve_names(implicit, candidates, required=False)
+    return resolved_e + resolved_i, questions, warnings
 
 
 # --- number-checked explanation ----------------------------------------------------------------
@@ -294,13 +327,14 @@ def answer(ctx: ChatContext, message: str, history: list[dict] | None = None) ->
         return _clarify(f"어떤 데이터셋을 말씀하신 건가요? 후보: {options or '(없음)'}", spec, started)
 
     ds = next(d for d in full_catalog if d["name"] == ds_match)
-    metrics, metric_q = resolve_names(spec.get("metrics"), ds["metrics"])
-    entities, entity_q = resolve_names(spec.get("entities"), ds["entities"])
-    regions, region_q = resolve_names(spec.get("regions"), ds["regions"])
-    sources, source_q = resolve_names(spec.get("sources"), ds["sources"])
-    questions = metric_q + entity_q + region_q + source_q
+    metrics, metric_q, _ = resolve_names(spec.get("metrics"), ds["metrics"], required=True)
+    entities, entity_q, entity_drop = resolve_entities(spec.get("entities"), ds["entities"], message)
+    regions, _, region_drop = resolve_names(spec.get("regions"), ds["regions"], required=False)
+    sources, _, source_drop = resolve_names(spec.get("sources"), ds["sources"], required=False)
+    questions = metric_q + entity_q
     if questions:
         return _clarify(" / ".join(questions[:3]), spec, started)
+    drop_warnings = entity_drop + region_drop + source_drop
 
     if spec.get("version") == "history":
         if not metrics or not entities:
@@ -329,6 +363,7 @@ def answer(ctx: ChatContext, message: str, history: list[dict] | None = None) ->
         chart = _chart_from_wide(table, spec.get("chart") or "table", len(row_dims))
         value_cols = list(range(len(row_dims), len(table["columns"])))  # id/dim columns excluded
 
-    sentence, warnings = explain(ctx.llm, table, value_cols)
+    sentence, explain_warnings = explain(ctx.llm, table, value_cols)
     return {"answer": sentence, "spec": spec, "table": table, "chart": chart,
-            "warnings": warnings, "seconds": round(time.perf_counter() - started, 2)}
+            "warnings": drop_warnings + explain_warnings,
+            "seconds": round(time.perf_counter() - started, 2)}
